@@ -8,6 +8,14 @@ import type {
   MailroomBucket,
   MailroomSystemType,
 } from "@/lib/mailroom/types";
+import {
+  isActionableMeetingInvitation,
+  normalizeOutlookMetadata,
+  type OutlookHeader,
+} from "@/lib/mailroom/normalizeOutlookMetadata";
+import { defaultRequestedAction } from "@/lib/mailroom/actionModel";
+
+const MAILBOX_OWNER_EMAIL = "dmerry@suffolk.edu";
 
 type EmailRow = {
   outlook_message_id: string;
@@ -24,11 +32,28 @@ type EmailRow = {
   is_read: boolean | null;
   is_in_inbox: boolean | null;
   processed: boolean | null;
+  internet_message_headers: OutlookHeader[] | null;
+  is_calendar_related: boolean | null;
+  calendar_message_kind: string | null;
+  calendar_action: string | null;
+  calendar_series_instance_id: string | null;
+  to_recipients: string[] | null;
+  cc_recipients: string[] | null;
+  is_auto_reply: boolean | null;
+  is_mailing_list: boolean | null;
+  is_system_generated: boolean | null;
+  list_id: string | null;
 };
 
 function toMailMessage(
   row: EmailRow
 ): MailMessage {
+  const normalized = normalizeOutlookMetadata({
+    headers: row.internet_message_headers,
+    subject: row.subject,
+    body: row.body_html,
+    bodyPreview: row.body_preview,
+  });
   return {
     outlookMessageId:
       row.outlook_message_id,
@@ -72,6 +97,17 @@ function toMailMessage(
 
   processed:
   row.processed,
+    isCalendarRelated: row.is_calendar_related === true || normalized.isCalendarRelated,
+    calendarMessageKind: row.calendar_message_kind ?? normalized.calendarMessageKind,
+    calendarAction: row.calendar_action ?? normalized.calendarAction,
+    calendarSeriesInstanceId: row.calendar_series_instance_id ?? normalized.calendarSeriesInstanceId,
+    isMeetingForward: normalized.isMeetingForward,
+    toRecipients: row.to_recipients ?? [],
+    ccRecipients: row.cc_recipients ?? [],
+    isAutoReply: row.is_auto_reply === true || normalized.isAutoReply,
+    isMailingList: row.is_mailing_list === true || normalized.isMailingList,
+    isSystemGenerated: row.is_system_generated === true || normalized.isSystemGenerated,
+    listId: row.list_id ?? normalized.listId,
   };
 }
 
@@ -156,6 +192,8 @@ export function isSystemNoise(
     "";
 
   return (
+    message.isAutoReply ||
+    message.isCalendarRelated ||
     rawSubject.startsWith(
       "automatic reply:"
     ) ||
@@ -250,6 +288,12 @@ function getMessageSystemType(
       .filter(Boolean)
       .join("\n")
       .toLowerCase();
+
+  if (message.isCalendarRelated) {
+    return message.calendarAction || message.calendarMessageKind === "cancellation"
+      ? "calendar_response"
+      : "meeting_request";
+  }
 
   if (
     sender ===
@@ -427,6 +471,18 @@ function temporaryBucket(
       ?.toLowerCase() ??
     "";
 
+  if (sender === "suffolk@myworkday.com" || sender.endsWith("@myworkday.com")) {
+    return "Workday";
+  }
+
+  if (message.isCalendarRelated) {
+    return "Calendar";
+  }
+
+  if (message.isAutoReply) {
+    return "Low Value";
+  }
+
   const subject =
     message.subject
       ?.toLowerCase() ??
@@ -495,18 +551,14 @@ function getMessageTime(
   ).getTime();
 }
 
-function defaultActionsForBucket(
-  bucket: MailroomBucket
-) {
-  const needsAction =
-    bucket === "Needs You";
-
-  return {
-    needsAction,
-    archive:
-      !needsAction,
-  };
-}
+const BUCKET_TO_CATEGORY: Record<MailroomBucket, "needs_you" | "fyi" | "professional_news" | "low_value" | "calendar" | "workday"> = {
+  "Needs You": "needs_you",
+  FYI: "fyi",
+  "Professional News": "professional_news",
+  "Low Value": "low_value",
+  Calendar: "calendar",
+  Workday: "workday",
+};
 
 type LoadMailroomOptions = {
   includeProcessed?: boolean;
@@ -541,6 +593,17 @@ export async function loadMailroomConversations(
         is_read,
         is_in_inbox,
         processed
+        ,internet_message_headers
+        ,is_calendar_related
+        ,calendar_message_kind
+        ,calendar_action
+        ,calendar_series_instance_id
+        ,to_recipients
+        ,cc_recipients
+        ,is_auto_reply
+        ,is_mailing_list
+        ,is_system_generated
+        ,list_id
         `
       )
       .eq(
@@ -635,6 +698,17 @@ export async function loadMailroomConversations(
           is_read,
           is_in_inbox,
           processed
+          ,internet_message_headers
+          ,is_calendar_related
+          ,calendar_message_kind
+          ,calendar_action
+          ,calendar_series_instance_id
+          ,to_recipients
+          ,cc_recipients
+          ,is_auto_reply
+          ,is_mailing_list
+          ,is_system_generated
+          ,list_id
           `
         )
         .in(
@@ -767,15 +841,51 @@ export async function loadMailroomConversations(
       latestIncoming ??
       latestMessage;
 
+    const incomingMessages = sortedMessages.filter((message) =>
+      message.direction.toLowerCase() === "incoming");
+    const isCalendarRelated = inboxMessages.some((message) => message.isCalendarRelated);
+    const isMailingList = incomingMessages.some((message) => message.isMailingList);
+    const listId = [...incomingMessages].reverse().find((message) => message.listId)?.listId ?? null;
+    const isAutoReply = incomingMessages.length > 0 &&
+      incomingMessages.every((message) => message.isAutoReply || message.isCalendarRelated);
+
     const bucket =
       temporaryBucket(
         representativeMessage
       );
 
-    const defaults =
-      defaultActionsForBucket(
-        bucket
-      );
+    /*
+     * Accept Invite eligibility is decided ONLY by the deterministic
+     * structural predicate. The previous check (kind === "meeting_message"
+     * && !action) had real false positives in this mailbox: forwarded
+     * meeting mail carries identical calendar headers.
+     */
+    const isMeetingInvitation = isActionableMeetingInvitation(
+      {
+        calendarMessageKind: latestMessage.calendarMessageKind as
+          | "meeting_response"
+          | "meeting_message"
+          | "cancellation"
+          | null,
+        calendarAction: latestMessage.calendarAction as
+          | "accepted"
+          | "declined"
+          | "tentative"
+          | "cancelled"
+          | null,
+        calendarSeriesInstanceId: latestMessage.calendarSeriesInstanceId,
+        isMeetingForward: latestMessage.isMeetingForward,
+        direction: latestMessage.direction,
+        subject: latestMessage.subject,
+        toRecipients: latestMessage.toRecipients,
+        ccRecipients: latestMessage.ccRecipients,
+        isInInbox: latestMessage.isInInbox,
+      },
+      MAILBOX_OWNER_EMAIL
+    );
+
+    const requestedAction =
+      defaultRequestedAction(BUCKET_TO_CATEGORY[bucket], isMeetingInvitation);
 
     conversations.push({
       conversationId,
@@ -823,17 +933,20 @@ export async function loadMailroomConversations(
           sortedMessages
         ),
 
+      isCalendarRelated,
+      isAutoReply,
+      isMailingList,
+      listId,
+
       bucket,
 
       summary:
         representativeMessage.bodyPreview ||
         "No preview available.",
 
-      needsAction:
-        defaults.needsAction,
+      requestedAction,
 
-      archive:
-        defaults.archive,
+      isMeetingInvitation,
 
       feedback:
         "",

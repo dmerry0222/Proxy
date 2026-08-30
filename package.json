@@ -6,13 +6,26 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:mailroom-metadata": "node --experimental-strip-types --test test-mailroom-metadata.mjs",
+    "test:memory-reconciliation": "node --experimental-strip-types --test test-memory-reconciliation.mjs",
+    "test:ownership-rules": "node --experimental-strip-types --test test-ownership-rules.mjs",
+    "test:title-similarity": "node --experimental-strip-types --test test-title-similarity.mjs",
+    "test:teams-identity": "node --experimental-strip-types --test test-teams-identity.mjs",
+    "test:calendar-classify": "node --experimental-strip-types --test test-calendar-classify.mjs",
+    "test:review-transitions": "node --experimental-strip-types --test test-review-transitions.mjs",
+    "test:priority-policy": "node --experimental-strip-types --test test-priority-policy.mjs",
+    "test:mailroom-action-model": "node --experimental-strip-types --test test-mailroom-action-model.mjs",
+    "test:invitation-gate": "node --experimental-strip-types --test test-invitation-gate.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.120.0",
+    "@notionhq/client": "^5.26.0",
     "@supabase/supabase-js": "^2.112.3",
     "lucide-react": "^1.33.0",
+    "mammoth": "1.12.1",
     "next": "16.3.2",
+    "pdf-parse": "2.4.5",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "resend": "^6.22.0"

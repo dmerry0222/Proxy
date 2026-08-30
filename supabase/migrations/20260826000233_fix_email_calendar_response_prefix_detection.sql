@@ -1,0 +1,8 @@
+-- This remote-tracked migration's SQL could not be recovered: it sits
+-- between 20260825235739_normalize_outlook_email_metadata.sql (original
+-- function) and 20260826000444_fix_calendar_subject_action.sql (which this
+-- repo does have, and which matches the function's current live definition
+-- exactly). Whatever this intermediate fix changed, its net effect is
+-- already captured by 20260826000444. Left as an empty placeholder purely
+-- so the local migration timestamp sequence matches remote history; do not
+-- apply this file expecting it to change anything.

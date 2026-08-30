@@ -1,3 +1,5 @@
+import QuickIntake from "@/components/ingestion/QuickIntake";
+
 export default function HomePage() {
   return (
     <div className="space-y-8">
@@ -57,6 +59,8 @@ export default function HomePage() {
           </p>
         </section>
       </div>
+
+      <QuickIntake />
     </div>
   );
 }

@@ -1,8 +1,12 @@
+import type { RequestedAction } from "@/lib/mailroom/actionModel";
+
 export type MailroomBucket =
   | "Needs You"
   | "FYI"
   | "Professional News"
-  | "Low Value";
+  | "Low Value"
+  | "Calendar"
+  | "Workday";
 
 export type MailroomSystemType =
   | "workday"
@@ -24,6 +28,17 @@ export type MailMessage = {
   isRead: boolean | null;
   isInInbox: boolean | null;
   processed: boolean | null;
+  isCalendarRelated: boolean;
+  calendarMessageKind: string | null;
+  calendarAction: string | null;
+  calendarSeriesInstanceId: string | null;
+  isMeetingForward: boolean;
+  toRecipients: string[];
+  ccRecipients: string[];
+  isAutoReply: boolean;
+  isMailingList: boolean;
+  isSystemGenerated: boolean;
+  listId: string | null;
 };
 
 export type MailConversation = {
@@ -32,6 +47,11 @@ export type MailConversation = {
   systemType?:
     | MailroomSystemType
     | null;
+
+  isCalendarRelated: boolean;
+  isAutoReply: boolean;
+  isMailingList: boolean;
+  listId: string | null;
 
   subject: string;
 
@@ -69,10 +89,10 @@ export type MailConversation = {
   summary:
     string;
 
-  needsAction:
-    boolean;
+  requestedAction:
+    RequestedAction;
 
-  archive:
+  isMeetingInvitation:
     boolean;
 
   feedback:

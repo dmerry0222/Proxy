@@ -1,0 +1,44 @@
+[
+  {
+    "name": "ordinary email",
+    "subject": "Project update",
+    "bodyPreview": "Here is the requested update.",
+    "headers": [{ "name": "X-MS-TrafficTypeDiagnostic", "value": "EE_" }],
+    "expected": { "route": null, "isCalendarRelated": false, "isAutoReply": false, "isMailingList": false }
+  },
+  {
+    "name": "meeting message",
+    "subject": "Weekly project sync",
+    "headers": [
+      { "name": "x-ms-traffictypediagnostic", "value": "EE_MeetingMessage" },
+      { "name": "X-MS-Exchange-Calendar-Series-Instance-Id", "value": "series-123" },
+      { "name": "X-MS-Exchange-Calendar-Originator-Id", "value": "originator-456" }
+    ],
+    "expected": { "route": "calendar", "isCalendarRelated": true, "calendarMessageKind": "meeting_message", "calendarSeriesInstanceId": "series-123", "calendarOriginatorId": "originator-456" }
+  },
+  {
+    "name": "automatic reply",
+    "subject": "Automatic reply: Project update",
+    "headers": [
+      { "name": "Auto-Submitted", "value": "auto-generated" },
+      { "name": "X-MS-Exchange-Generated-Message-Source", "value": "Mailbox Rules Agent" }
+    ],
+    "expected": { "route": "low_value", "isAutoReply": true, "isSystemGenerated": true }
+  },
+  {
+    "name": "mailing-list message",
+    "subject": "Higher education weekly",
+    "headers": [
+      { "name": "Precedence", "value": "list" },
+      { "name": "List-Id", "value": "Higher Ed Weekly <weekly.example.org>" }
+    ],
+    "expected": { "route": null, "isMailingList": true, "listId": "Higher Ed Weekly <weekly.example.org>" }
+  },
+  {
+    "name": "accepted response with ordinary traffic diagnostic",
+    "subject": "Accepted: Weekly project sync",
+    "bodyPreview": "",
+    "headers": [{ "name": "X-MS-TrafficTypeDiagnostic", "value": "EE_" }],
+    "expected": { "route": "calendar", "isCalendarRelated": true, "calendarMessageKind": "meeting_response", "calendarAction": "accepted" }
+  }
+]

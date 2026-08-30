@@ -10,6 +10,7 @@ import type {
   MailConversation,
   MailroomBucket,
 } from "@/lib/mailroom/types";
+import { defaultRequestedAction, isRequestedAction, type RequestedAction } from "@/lib/mailroom/actionModel";
 
 type StoredConversation = {
   id: string;
@@ -27,25 +28,8 @@ type StoredConversation = {
     | string
     | null;
   created_at: string;
-};
-
-type StoredAction = {
-  mailroom_conversation_id:
-    string;
-
-  outlook_message_id:
-    | string
-    | null;
-
-  action_type:
-    string;
-
-  proposed_value:
-    boolean;
-
-  approved_value?:
-    | boolean
-    | null;
+  requested_action: string | null;
+  is_meeting_invitation: boolean | null;
 };
 
 function databaseCategoryToUi(
@@ -64,25 +48,27 @@ function databaseCategoryToUi(
     case "low_value":
       return "Low Value";
 
+    case "calendar":
+    case "calendar_system":
+      return "Calendar";
+
+    case "workday":
+    case "workday_system":
+      return "Workday";
+
     default:
       return "FYI";
   }
 }
 
-function defaultActionsForBucket(
-  bucket: MailroomBucket
-) {
-  const needsAction =
-    bucket ===
-    "Needs You";
-
-  return {
-    needsAction,
-
-    archive:
-      !needsAction,
-  };
-}
+const BUCKET_TO_CATEGORY: Record<MailroomBucket, "needs_you" | "fyi" | "professional_news" | "low_value" | "calendar" | "workday"> = {
+  "Needs You": "needs_you",
+  FYI: "fyi",
+  "Professional News": "professional_news",
+  "Low Value": "low_value",
+  Calendar: "calendar",
+  Workday: "workday",
+};
 
 export type MailroomReviewConversation =
   MailConversation & {
@@ -101,14 +87,8 @@ export type MailroomReviewConversation =
     originalBucket:
       MailroomBucket;
 
-    originalNeedsAction:
-      boolean;
-
-    originalArchive:
-      boolean;
-
-    acceptMeeting:
-      boolean;
+    originalRequestedAction:
+      RequestedAction;
 
     /*
      * True only when this conversation belongs to the
@@ -178,7 +158,9 @@ async function loadStoredConversations(
           requires_attention,
           confidence,
           suggested_reply,
-          created_at
+          created_at,
+          requested_action,
+          is_meeting_invitation
           `
         )
         .in(
@@ -203,76 +185,6 @@ async function loadStoredConversations(
       ...(
         (data ??
           []) as StoredConversation[]
-      )
-    );
-  }
-
-  return rows;
-}
-
-async function loadStoredActions(
-  mailroomConversationIds: string[]
-): Promise<StoredAction[]> {
-  if (
-    mailroomConversationIds.length ===
-    0
-  ) {
-    return [];
-  }
-
-  const CHUNK_SIZE =
-    50;
-
-  const rows:
-    StoredAction[] =
-      [];
-
-  for (
-    let index = 0;
-    index <
-    mailroomConversationIds.length;
-    index +=
-      CHUNK_SIZE
-  ) {
-    const chunk =
-      mailroomConversationIds.slice(
-        index,
-        index +
-          CHUNK_SIZE
-      );
-
-    const {
-      data,
-      error,
-    } =
-      await supabaseServer
-        .from(
-          "mailroom_actions"
-        )
-        .select(
-          `
-          mailroom_conversation_id,
-          outlook_message_id,
-          action_type,
-          proposed_value,
-          approved_value
-          `
-        )
-        .in(
-          "mailroom_conversation_id",
-          chunk
-        );
-
-    if (error) {
-      throw new Error(
-        `Could not load stored Mailroom actions: ${error.message}`
-      );
-    }
-
-    rows.push(
-      ...(
-        (data ??
-          []) as StoredAction[]
       )
     );
   }
@@ -395,47 +307,6 @@ export async function loadLatestMailroomRun(): Promise<{
     }
   }
 
-  const latestStoredRows =
-    [
-      ...latestStoredByConversation.values(),
-    ];
-
-  const storedActions =
-    await loadStoredActions(
-      latestStoredRows.map(
-        (
-          conversation
-        ) =>
-          conversation.id
-      )
-    );
-
-  const actionsByMailroomConversation =
-    new Map<
-      string,
-      StoredAction[]
-    >();
-
-  for (
-    const action
-    of storedActions
-  ) {
-    const existing =
-      actionsByMailroomConversation.get(
-        action.mailroom_conversation_id
-      ) ??
-      [];
-
-    existing.push(
-      action
-    );
-
-    actionsByMailroomConversation.set(
-      action.mailroom_conversation_id,
-      existing
-    );
-  }
-
   const merged:
     MailroomReviewConversation[] =
       liveConversations.map(
@@ -471,19 +342,14 @@ export async function loadLatestMailroomRun(): Promise<{
             !analysis ||
             !analysisIsCurrentForThread
           ) {
-            const defaults =
-              defaultActionsForBucket(
-                conversation.bucket
-              );
+            const defaultAction =
+              defaultRequestedAction(BUCKET_TO_CATEGORY[conversation.bucket], conversation.isMeetingInvitation);
 
             return {
               ...conversation,
 
-              needsAction:
-                defaults.needsAction,
-
-              archive:
-                defaults.archive,
+              requestedAction:
+                defaultAction,
 
               mailroomConversationId:
                 null,
@@ -500,14 +366,8 @@ export async function loadLatestMailroomRun(): Promise<{
               originalBucket:
                 conversation.bucket,
 
-              originalNeedsAction:
-                defaults.needsAction,
-
-              originalArchive:
-                defaults.archive,
-
-              acceptMeeting:
-                false,
+              originalRequestedAction:
+                defaultAction,
 
               isPendingReview:
                 false,
@@ -517,98 +377,16 @@ export async function loadLatestMailroomRun(): Promise<{
             };
           }
 
-          const actions =
-            actionsByMailroomConversation.get(
-              analysis.id
-            ) ??
-            [];
-
-          const latestInboxMessageId =
-            [
-              ...conversation.messages,
-            ]
-              .reverse()
-              .find(
-                (
-                  message
-                ) =>
-                  message.isInInbox ===
-                  true
-              )
-              ?.outlookMessageId ??
-            null;
-
-          const archiveAction =
-            actions.find(
-              (
-                action
-              ) =>
-                action.action_type ===
-                  "archive" &&
-                action.outlook_message_id ===
-                  latestInboxMessageId
-            );
-
-          const needsActionAction =
-            actions.find(
-              (
-                action
-              ) =>
-                action.action_type ===
-                  "needs_action" &&
-                action.outlook_message_id ===
-                  latestInboxMessageId
-            );
-
-          /*
-           * Legacy compatibility for old Mailroom runs.
-           */
-          const legacyFlagAction =
-            actions.find(
-              (
-                action
-              ) =>
-                action.action_type ===
-                  "flag" &&
-                action.outlook_message_id ===
-                  latestInboxMessageId
-            );
-
           const bucket =
             databaseCategoryToUi(
               analysis.category
             );
 
-          const defaults =
-            defaultActionsForBucket(
-              bucket
-            );
-
-          const needsAction =
-            needsActionAction
-              ?.approved_value ??
-            needsActionAction
-              ?.proposed_value ??
-            legacyFlagAction
-              ?.approved_value ??
-            legacyFlagAction
-              ?.proposed_value ??
-            defaults.needsAction;
-
-          let archive =
-            archiveAction
-              ?.approved_value ??
-            archiveAction
-              ?.proposed_value ??
-            defaults.archive;
-
-          if (
-            needsAction &&
-            archive
-          ) {
-            archive =
-              false;
-          }
+          const isMeetingInvitation = analysis.is_meeting_invitation === true;
+          const requestedAction: RequestedAction =
+            isRequestedAction(analysis.requested_action)
+              ? analysis.requested_action
+              : defaultRequestedAction(BUCKET_TO_CATEGORY[bucket], isMeetingInvitation);
 
           const isPendingReview =
             reviewRun?.id ===
@@ -622,13 +400,13 @@ export async function loadLatestMailroomRun(): Promise<{
 
             bucket,
 
+            isMeetingInvitation,
+
             summary:
               analysis.summary ??
               conversation.summary,
 
-            needsAction,
-
-            archive,
+            requestedAction,
 
             requiresAttention:
               analysis.requires_attention,
@@ -647,14 +425,8 @@ export async function loadLatestMailroomRun(): Promise<{
             originalBucket:
               bucket,
 
-            originalNeedsAction:
-              needsAction,
-
-            originalArchive:
-              archive,
-
-            acceptMeeting:
-              false,
+            originalRequestedAction:
+              requestedAction,
 
             isPendingReview,
 

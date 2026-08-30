@@ -225,10 +225,27 @@ export async function loadMemoryReviewItems(): Promise<
       pendingContextId:
         row.pending_context_id,
 
-      options:
-        row.payload
-          ?.options ??
-        [],
+      options: (() => {
+        const options =
+          row.payload?.options ?? [];
+
+        /*
+         * Older claim-review rows predate the Dismiss action.
+         * Add it at read time so the restored option is available
+         * without rewriting historical payloads.
+         */
+        if (
+          row.review_type === "confirm_claim" &&
+          !options.some(
+            (option) =>
+              option.trim().toLowerCase() === "dismiss"
+          )
+        ) {
+          return [...options, "Dismiss"];
+        }
+
+        return options;
+      })(),
 
       createdAt:
         row.created_at,

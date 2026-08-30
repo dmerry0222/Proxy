@@ -1,11 +1,14 @@
-export default function ExecutePage() {
-  return (
-    <div>
-      <h1 className="text-2xl font-semibold">Execute</h1>
-      <p className="mt-2 text-neutral-500">
-        Projects, tasks, dependencies, deadlines, and protected time to get
-        the work done.
-      </p>
-    </div>
-  );
+import ExecuteDashboard from "@/components/execute/ExecuteDashboard";
+import { loadExecuteDashboard } from "@/lib/execute/loadDashboard";
+import { loadReconciliationReview } from "@/lib/execute/loadReconciliationReview";
+import { ensureOverdueExternalAttention } from "@/lib/execute/overdueExternal";
+
+export const dynamic = "force-dynamic";
+
+export default async function ExecutePage() {
+  await ensureOverdueExternalAttention().catch((error) => {
+    console.error("Could not check overdue external work:", error);
+  });
+  const [dashboard, review] = await Promise.all([loadExecuteDashboard(), loadReconciliationReview()]);
+  return <ExecuteDashboard initialDashboard={dashboard} reviewEntries={review.entries} />;
 }

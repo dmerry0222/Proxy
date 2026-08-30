@@ -4,6 +4,13 @@ import Anthropic from "@anthropic-ai/sdk";
 
 import { supabaseServer } from "@/lib/supabase/server";
 import { resolveMemoryEntityByEmail } from "@/lib/memory/resolveEntity";
+import { reconcileMemoryClaim } from "@/lib/memory/claimReconciliation";
+import { startTrace, completeTrace, emitDiagnosticEvent, recordIssue } from "@/lib/diagnostics/emitEvent";
+import { htmlToPlainText } from "@/lib/memory/htmlToPlainText";
+import { extractEmailOperationalEvidence } from "@/lib/reconciliation/emailEvidence";
+import { reconcileEnvelope } from "@/lib/reconciliation/reconcileEnvelope";
+import { completeReconciliationRun, emptyCounters, recordReconciliationDecision, startReconciliationRun } from "@/lib/reconciliation/runs";
+import type { ReconciliationTrigger } from "@/lib/reconciliation/types";
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -108,70 +115,8 @@ function redactSensitiveContent(
     );
 }
 
-function htmlToPlainText(
-  html: string
-) {
-  return html
-    .replace(
-      /<style[\s\S]*?<\/style>/gi,
-      " "
-    )
-    .replace(
-      /<script[\s\S]*?<\/script>/gi,
-      " "
-    )
-    .replace(
-      /<br\s*\/?>/gi,
-      "\n"
-    )
-    .replace(
-      /<\/p>/gi,
-      "\n"
-    )
-    .replace(
-      /<\/div>/gi,
-      "\n"
-    )
-    .replace(
-      /<[^>]+>/g,
-      " "
-    )
-    .replace(
-      /&nbsp;/gi,
-      " "
-    )
-    .replace(
-      /&amp;/gi,
-      "&"
-    )
-    .replace(
-      /&lt;/gi,
-      "<"
-    )
-    .replace(
-      /&gt;/gi,
-      ">"
-    )
-    .replace(
-      /&quot;/gi,
-      '"'
-    )
-    .replace(
-      /&#39;/gi,
-      "'"
-    )
-    .replace(
-      /[ \t]+/g,
-      " "
-    )
-    .replace(
-      /\n\s*\n\s*\n+/g,
-      "\n\n"
-    )
-    .trim();
-}
 
-function stripQuotedReplyHistory(
+export function stripQuotedReplyHistory(
   text: string
 ) {
   const markers = [
@@ -416,8 +361,135 @@ function parseExtractionJson(
   );
 }
 
+/**
+ * The Action Reconciliation half of email ingestion, extracted so a
+ * historical backfill can force it directly for an email whose Memory
+ * ingestion is already at the current version (and would otherwise skip
+ * past this step entirely) without duplicating this logic in a second
+ * pipeline. Behavior is unchanged from before the extraction -- same
+ * calls, same error isolation (a failure here is logged, never thrown,
+ * so it can never affect the caller's own success).
+ */
+export async function reconcileEmailEvidence(input: {
+  outlookMessageId: string;
+  establishedSourceId: string;
+  subject: string | null;
+  messageAt: string;
+  senderName: string | null;
+  senderEmail: string;
+  senderEntityId: string;
+  content: string;
+  trigger: ReconciliationTrigger;
+}): Promise<void> {
+  try {
+    const { runId, traceId: reconciliationTraceId } = await startReconciliationRun({
+      trigger: input.trigger,
+      sourceType: "email",
+      sourceId: input.outlookMessageId,
+      summary: `Reconcile email: ${input.subject ?? "Untitled"}`,
+      metadata: { outlookMessageId: input.outlookMessageId, sourceId: input.establishedSourceId },
+    });
+    const counters = emptyCounters();
+
+    try {
+      const classified = await extractEmailOperationalEvidence({
+        subject: input.subject,
+        messageAt: input.messageAt,
+        senderName: input.senderName,
+        senderEmail: input.senderEmail,
+        senderEntityId: input.senderEntityId,
+        content: input.content,
+      });
+      counters.evidenceConsidered = classified.length;
+
+      for (const { raw, envelope } of classified) {
+        if (!envelope) {
+          counters.itemsIgnored += 1;
+          await recordReconciliationDecision(reconciliationTraceId, {
+            runId,
+            evidenceRef: { outlookMessageId: input.outlookMessageId, kind: raw.kind ?? "none" },
+            outcome: "no_action",
+            automatic: true,
+            reasoningSummary:
+              raw.kind && raw.kind !== "none"
+                ? `Classified as "${raw.kind}" but missing a required field (excerpt, valid ownership basis, or resolvable external actor); no action taken.`
+                : "No ownership, completion, or cancellation evidence cleared the bar for operational action.",
+          });
+          continue;
+        }
+
+        const fullEnvelope = {
+          ...envelope,
+          sourceType: "email" as const,
+          sourceLocator: { outlook_message_id: input.outlookMessageId },
+        };
+        const result = await reconcileEnvelope({ envelope: fullEnvelope, runId, traceId: reconciliationTraceId });
+        if (result.outcome === "create_dave_item" || result.outcome === "create_external_item") {
+          counters.itemsCreated += 1;
+        } else if (result.executionItemId) {
+          counters.itemsMatched += 1;
+        } else {
+          counters.itemsIgnored += 1;
+        }
+      }
+
+      await completeReconciliationRun(runId, reconciliationTraceId, {
+        status: "completed",
+        counters,
+        summary: `Email reconciled: ${counters.itemsCreated} created, ${counters.itemsMatched} matched, ${counters.itemsIgnored} ignored`,
+      });
+    } catch (innerError) {
+      counters.errors += 1;
+      await completeReconciliationRun(runId, reconciliationTraceId, {
+        status: "failed",
+        counters,
+        summary: innerError instanceof Error ? innerError.message : "Unknown error",
+      });
+      throw innerError;
+    }
+  } catch (reconciliationError) {
+    console.error("Action reconciliation failed for email", input.outlookMessageId, reconciliationError);
+  }
+}
+
 export async function ingestEmailToMemory(
-  outlookMessageId: string
+  outlookMessageId: string,
+  reconciliationTrigger: ReconciliationTrigger = "forward"
+) {
+  const traceId = await startTrace({
+    module: "memory",
+    sourceType: "email",
+    sourceId: outlookMessageId,
+    objectType: "email",
+    objectId: outlookMessageId,
+    summary: "Processing email",
+  });
+
+  try {
+    return await ingestEmailToMemoryTraced(outlookMessageId, traceId, reconciliationTrigger);
+  } catch (error) {
+    await recordIssue({
+      traceId,
+      issueType: "email_ingestion_failure",
+      severity: "error",
+      humanSummary: "Proxy failed while processing this email for Memory.",
+      humanDetail: error instanceof Error ? error.message : "Unknown error",
+      objectType: "email",
+      objectId: outlookMessageId,
+      sourceType: "email",
+      sourceId: outlookMessageId,
+      retryable: true,
+      technicalDetail: error instanceof Error ? (error.stack ?? error.message) : String(error),
+    });
+    await completeTrace(traceId, { status: "failed", summary: "Email processing failed." });
+    throw error;
+  }
+}
+
+async function ingestEmailToMemoryTraced(
+  outlookMessageId: string,
+  traceId: string | null,
+  reconciliationTrigger: ReconciliationTrigger = "forward"
 ) {
   /*
    * 1. Load canonical email.
@@ -464,6 +536,18 @@ export async function ingestEmailToMemory(
   const loadedEmail =
     email;
 
+  await emitDiagnosticEvent({
+    traceId,
+    module: "memory",
+    stage: "received",
+    eventType: "email_loaded",
+    status: "success",
+    objectType: "email",
+    objectId: outlookMessageId,
+    humanSummary: `Received email: "${loadedEmail.subject ?? "Untitled"}"`,
+    metadata: { from: loadedEmail.from_email },
+  });
+
   /*
    * 2. Resolve sender.
    */
@@ -473,6 +557,17 @@ export async function ingestEmailToMemory(
     );
 
   if (!resolution) {
+    await emitDiagnosticEvent({
+      traceId,
+      module: "memory",
+      stage: "identified",
+      eventType: "sender_resolution",
+      status: "warning",
+      humanSummary: "Proxy couldn't match the sender to a known person, so this email was skipped.",
+      metadata: { from: loadedEmail.from_email },
+    });
+    await completeTrace(traceId, { status: "completed", summary: "Skipped — sender not recognized." });
+
     return {
       ingested:
         false,
@@ -481,6 +576,17 @@ export async function ingestEmailToMemory(
         "sender_not_resolved",
     };
   }
+
+  await emitDiagnosticEvent({
+    traceId,
+    module: "memory",
+    stage: "identified",
+    eventType: "sender_resolution",
+    status: "success",
+    objectType: "memory_entity",
+    objectId: resolution.entityId,
+    humanSummary: `Recognized sender as ${resolution.canonicalName}.`,
+  });
 
   /*
    * 3. Find or create Memory source.
@@ -553,6 +659,8 @@ export async function ingestEmailToMemory(
     existingVersion >=
       MEMORY_EMAIL_INGESTION_VERSION
   ) {
+    await completeTrace(traceId, { status: "completed", summary: "Already processed by Memory." });
+
     return {
       ingested:
         false,
@@ -669,6 +777,19 @@ export async function ingestEmailToMemory(
   const establishedSourceId =
     sourceId;
 
+  await emitDiagnosticEvent({
+    traceId,
+    module: "memory",
+    stage: "stored",
+    eventType: "memory_source_ready",
+    status: "success",
+    objectType: "memory_source",
+    objectId: establishedSourceId,
+    humanSummary: existingSource
+      ? "Found the existing Memory source record for this email."
+      : "Stored this email as a Memory source.",
+  });
+
   async function markSourceProcessed(
     extraMetadata:
       Record<
@@ -733,6 +854,18 @@ export async function ingestEmailToMemory(
       memory_skip_reason:
         "routine_calendar_response",
     });
+
+    await emitDiagnosticEvent({
+      traceId,
+      module: "memory",
+      stage: "extracted",
+      eventType: "extraction_skipped",
+      status: "success",
+      objectType: "memory_source",
+      objectId: establishedSourceId,
+      humanSummary: "Skipped extraction — this was a routine calendar response, not meaningful content.",
+    });
+    await completeTrace(traceId, { status: "completed", summary: "Skipped — routine calendar response." });
 
     return {
       ingested:
@@ -1112,9 +1245,24 @@ ${emailContent}
           )
       : [];
 
+  await emitDiagnosticEvent({
+    traceId,
+    module: "memory",
+    stage: "extracted",
+    eventType: "extraction_complete",
+    status: "success",
+    objectType: "memory_source",
+    objectId: establishedSourceId,
+    humanSummary: `Extracted ${claims.length} observation${claims.length === 1 ? "" : "s"} and ${
+      pendingContext.length
+    } pending item${pendingContext.length === 1 ? "" : "s"} from this email.`,
+    metadata: { claims_extracted: claims.length, pending_extracted: pendingContext.length },
+  });
+
   /*
    * 8. Create candidate claims.
    */
+  let claimsCreated = 0;
   for (
     const claim
     of claims
@@ -1141,267 +1289,25 @@ ${emailContent}
       claim.statement
         .trim();
 
-    const {
-      data:
-        evidence,
-      error:
-        evidenceError,
-    } =
-      await supabaseServer
-        .from(
-          "memory_evidence"
-        )
-        .insert({
-          source_id:
-            establishedSourceId,
-
-          evidence_type:
-            "excerpt",
-
-          content:
-            statement,
-
-          effective_from:
-            loadedEmail.message_at,
-
-          visibility:
-            "normal",
-
-          extracted_by:
-            "ai",
-
-          metadata: {
-            extraction_type:
-              "claim_candidate",
-
-            ingestion_version:
-              MEMORY_EMAIL_INGESTION_VERSION,
-          },
-        })
-        .select("id")
-        .single();
-
-    if (
-      evidenceError ||
-      !evidence
-    ) {
-      throw new Error(
-        `Could not create Memory evidence: ${
-          evidenceError
-            ?.message ??
-          "Unknown error"
-        }`
-      );
-    }
-
-    const {
-      error:
-        evidenceEntityError,
-    } =
-      await supabaseServer
-        .from(
-          "memory_evidence_entities"
-        )
-        .insert({
-          evidence_id:
-            evidence.id,
-
-          entity_id:
-            resolution.entityId,
-
-          relationship:
-            "subject",
-        });
-
-    if (
-      evidenceEntityError
-    ) {
-      throw new Error(
-        `Could not connect Memory evidence to entity: ${evidenceEntityError.message}`
-      );
-    }
-
-    const {
-      data:
-        newClaim,
-      error:
-        claimError,
-    } =
-      await supabaseServer
-        .from(
-          "memory_claims"
-        )
-        .insert({
-          claim_type:
-            claimType,
-
-          statement,
-
-          status:
-            "candidate",
-
-          learned_at:
-            new Date()
-              .toISOString(),
-
-          evidence_strength:
-            evidenceStrength,
-
-          promotion_basis:
-            "ai_extraction",
-
-          confirmed_by_user:
-            false,
-
-          visibility:
-            "normal",
-
-          created_by:
-            "ai",
-
-          metadata: {
-            source_type:
-              "email",
-
-            source_id:
-              establishedSourceId,
-
-            ingestion_version:
-              MEMORY_EMAIL_INGESTION_VERSION,
-          },
-        })
-        .select("id")
-        .single();
-
-    if (
-      claimError ||
-      !newClaim
-    ) {
-      throw new Error(
-        `Could not create candidate claim: ${
-          claimError
-            ?.message ??
-          "Unknown error"
-        }`
-      );
-    }
-
-    const {
-      error:
-        claimEntityError,
-    } =
-      await supabaseServer
-        .from(
-          "memory_claim_entities"
-        )
-        .insert({
-          claim_id:
-            newClaim.id,
-
-          entity_id:
-            resolution.entityId,
-
-          role:
-            "subject",
-        });
-
-    if (
-      claimEntityError
-    ) {
-      throw new Error(
-        `Could not connect Memory claim to entity: ${claimEntityError.message}`
-      );
-    }
-
-    const {
-      error:
-        claimEvidenceError,
-    } =
-      await supabaseServer
-        .from(
-          "memory_claim_evidence"
-        )
-        .insert({
-          claim_id:
-            newClaim.id,
-
-          evidence_id:
-            evidence.id,
-
-          relationship:
-            "supports",
-        });
-
-    if (
-      claimEvidenceError
-    ) {
-      throw new Error(
-        `Could not connect Memory claim to evidence: ${claimEvidenceError.message}`
-      );
-    }
-
-    const {
-      error:
-        reviewError,
-    } =
-      await supabaseServer
-        .from(
-          "memory_review_items"
-        )
-        .insert({
-          review_type:
-            "confirm_claim",
-
-          status:
-            "pending",
-
-          title:
-            "Review extracted Memory",
-
-          prompt:
-            statement,
-
-          claim_id:
-            newClaim.id,
-
-          entity_id:
-            resolution.entityId,
-
-          priority:
-            40,
-
-          payload: {
-            options: [
-              "Confirm",
-              "Outdated",
-              "Keep as evidence",
-              "Not sure",
-            ],
-
-            generated_by:
-              "email_ingestion",
-
-            ingestion_version:
-              MEMORY_EMAIL_INGESTION_VERSION,
-
-            source_subject:
-              loadedEmail.subject,
-
-            source_date:
-              loadedEmail.message_at,
-
-            source_type:
-              "email",
-          },
-        });
-
-    if (
-      reviewError
-    ) {
-      throw new Error(
-        `Could not create Memory claim review item: ${reviewError.message}`
-      );
-    }
+    const reconciliation = await reconcileMemoryClaim({
+      entityId: resolution.entityId,
+      sourceId: establishedSourceId,
+      statement,
+      claimType,
+      evidenceContent: statement,
+      evidenceStrength,
+      effectiveFrom: loadedEmail.message_at,
+      evidenceMetadata: { extraction_type: "claim_candidate", ingestion_version: MEMORY_EMAIL_INGESTION_VERSION },
+      claimMetadata: { source_type: "email", source_id: establishedSourceId,
+        ingestion_version: MEMORY_EMAIL_INGESTION_VERSION },
+      reviewTitle: "Review extracted Memory",
+      reviewPriority: 40,
+      reviewPayload: { options: ["Confirm", "Outdated", "Keep as evidence", "Not sure", "Dismiss"],
+        generated_by: "email_ingestion", ingestion_version: MEMORY_EMAIL_INGESTION_VERSION,
+        source_subject: loadedEmail.subject, source_date: loadedEmail.message_at, source_type: "email" },
+      traceId,
+    });
+    if (reconciliation.claimCreated) claimsCreated += 1;
   }
 
   /*
@@ -1558,6 +1464,28 @@ ${emailContent}
   }
 
   /*
+   * 9.5. Action Reconciliation -- operational evidence.
+   *
+   * A separate, additional model call from the Memory extraction above,
+   * so a failure or future change here can never affect Memory's
+   * claims/pending-context behavior (Brief Part 8: "Keep Memory
+   * extraction unchanged"). Wrapped so any error is recorded, not thrown
+   * -- this step augments Execute state; it must never be the reason an
+   * email fails to be marked processed for Memory.
+   */
+  await reconcileEmailEvidence({
+    outlookMessageId,
+    establishedSourceId,
+    subject: loadedEmail.subject,
+    messageAt: loadedEmail.message_at,
+    senderName: loadedEmail.from_name,
+    senderEmail: loadedEmail.from_email,
+    senderEntityId: resolution.entityId,
+    content: emailContent,
+    trigger: reconciliationTrigger,
+  });
+
+  /*
    * 10. Mark source as successfully processed.
    *
    * Zero-output emails are still marked processed.
@@ -1567,10 +1495,29 @@ ${emailContent}
       "processed",
 
     memory_claims_created:
-      claims.length,
+      claimsCreated,
 
     memory_pending_created:
       pendingContext.length,
+  });
+
+  await emitDiagnosticEvent({
+    traceId,
+    module: "memory",
+    stage: "acted",
+    eventType: "email_ingestion_complete",
+    status: "success",
+    objectType: "memory_source",
+    objectId: establishedSourceId,
+    humanSummary: `Finished processing this email: ${claimsCreated} claim${
+      claimsCreated === 1 ? "" : "s"
+    } created, ${pendingContext.length} pending item${pendingContext.length === 1 ? "" : "s"} added.`,
+  });
+  await completeTrace(traceId, {
+    status: "completed",
+    summary: `Processed — ${claimsCreated} claim${claimsCreated === 1 ? "" : "s"}, ${
+      pendingContext.length
+    } pending item${pendingContext.length === 1 ? "" : "s"}.`,
   });
 
   return {
@@ -1587,7 +1534,7 @@ ${emailContent}
       MEMORY_EMAIL_INGESTION_VERSION,
 
     claimsCreated:
-      claims.length,
+      claimsCreated,
 
     pendingCreated:
       pendingContext.length,

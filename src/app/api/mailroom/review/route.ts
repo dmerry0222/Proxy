@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { ingestEmailToMemory } from "@/lib/memory/ingestEmail";
 import { supabaseServer } from "@/lib/supabase/server";
+import { isRequestedAction, type RequestedAction } from "@/lib/mailroom/actionModel";
 
 type ReviewItem = {
   conversationId: string;
@@ -21,19 +22,21 @@ type ReviewItem = {
     | "Needs You"
     | "FYI"
     | "Professional News"
-    | "Low Value";
+    | "Low Value"
+    | "Calendar"
+    | "Workday";
 
   originalBucket:
     | "Needs You"
     | "FYI"
     | "Professional News"
-    | "Low Value";
+    | "Low Value"
+    | "Calendar"
+    | "Workday";
 
-  needsAction: boolean;
-  originalNeedsAction: boolean;
-
-  archive: boolean;
-  originalArchive: boolean;
+  requestedAction: RequestedAction;
+  originalRequestedAction: RequestedAction;
+  isMeetingInvitation: boolean;
 
   feedback: string;
 };
@@ -48,6 +51,7 @@ type SourceConversation = {
   requires_attention: boolean;
   confidence: number | string | null;
   suggested_reply: string | null;
+  recommended_action: RequestedAction | null;
 };
 
 function categoryToDatabase(
@@ -139,7 +143,8 @@ async function loadSourceConversation(
         summary,
         requires_attention,
         confidence,
-        suggested_reply
+        suggested_reply,
+        recommended_action
         `
       )
       .eq(
@@ -188,30 +193,8 @@ async function ensureMailroomConversation(
       item.mailroomConversationId
     );
 
-  const itemType =
-    item.systemType ===
-    "meeting_request"
-      ? "meeting_request"
-      : item.systemType ===
-        "workday"
-        ? "workday_system"
-        : item.systemType ===
-          "calendar_response"
-          ? "calendar_system"
-          : "conversation";
-
-  const category =
-    item.systemType ===
-    "workday"
-      ? "workday_system"
-      : item.systemType ===
-          "calendar_response" ||
-        item.systemType ===
-          "meeting_request"
-        ? "calendar_system"
-        : categoryToDatabase(
-            item.bucket
-          );
+  const itemType = "conversation";
+  const category = categoryToDatabase(item.bucket);
 
   const {
     data,
@@ -257,6 +240,20 @@ async function ensureMailroomConversation(
             source
               ?.suggested_reply ??
             null,
+
+          is_meeting_invitation:
+            item.isMeetingInvitation,
+
+          /*
+           * The recommendation is classification-time truth. When copying a
+           * previously reviewed item into a new run, carry the ORIGINAL
+           * recommendation forward rather than the human's current
+           * selection -- otherwise every override would erase the very
+           * baseline that makes it measurable.
+           */
+          recommended_action:
+            source?.recommended_action ??
+            item.originalRequestedAction,
         },
         {
           onConflict:
@@ -281,117 +278,37 @@ async function ensureMailroomConversation(
   return data.id;
 }
 
-async function saveAction(
+/**
+ * Saves the SELECTED action. Deliberately does NOT execute anything:
+ * selecting an action is not a command (correction pass Part 1). Execution
+ * happens only via the explicit Process/Execute step
+ * (/api/mailroom/send-execution).
+ *
+ * Also preserves the recommendation-vs-selection signal (Part 2): the
+ * classification-time recommendation is never overwritten, and a divergence
+ * is recorded in the existing mailroom_feedback calibration table.
+ */
+async function saveSelectedAction(
   mailroomConversationId: string,
-  outlookMessageId: string,
-  actionType:
-    | "archive"
-    | "needs_action",
-  finalValue: boolean,
-  defaultProposedValue:
-    boolean = finalValue
+  selectedAction: RequestedAction,
+  recommendedAction: RequestedAction | null,
+  source: "proxy_ui" | "notion"
 ) {
-  const {
-    data:
-      existing,
-    error:
-      lookupError,
-  } =
-    await supabaseServer
-      .from(
-        "mailroom_actions"
-      )
-      .select(
-        "id, proposed_value"
-      )
-      .eq(
-        "mailroom_conversation_id",
-        mailroomConversationId
-      )
-      .eq(
-        "outlook_message_id",
-        outlookMessageId
-      )
-      .eq(
-        "action_type",
-        actionType
-      )
-      .maybeSingle();
+  const { error } = await supabaseServer
+    .from("mailroom_conversations")
+    .update({ requested_action: selectedAction, selected_action_source: source })
+    .eq("id", mailroomConversationId);
+  if (error) throw new Error(`Could not save selected action: ${error.message}`);
 
-  if (
-    lookupError
-  ) {
-    throw new Error(
-      `Could not inspect ${actionType}: ${lookupError.message}`
-    );
-  }
-
-  if (existing) {
-    const {
-      error:
-        updateError,
-    } =
-      await supabaseServer
-        .from(
-          "mailroom_actions"
-        )
-        .update({
-          approved_value:
-            finalValue,
-
-          status:
-            "approved",
-        })
-        .eq(
-          "id",
-          existing.id
-        );
-
-    if (
-      updateError
-    ) {
-      throw new Error(
-        `Could not approve ${actionType}: ${updateError.message}`
-      );
+  if (recommendedAction && recommendedAction !== selectedAction) {
+    const { error: feedbackError } = await supabaseServer.from("mailroom_feedback").insert({
+      mailroom_conversation_id: mailroomConversationId,
+      original_action: recommendedAction,
+      corrected_action: selectedAction,
+    });
+    if (feedbackError) {
+      throw new Error(`Could not record action override: ${feedbackError.message}`);
     }
-
-    return;
-  }
-
-  const {
-    error:
-      insertError,
-  } =
-    await supabaseServer
-      .from(
-        "mailroom_actions"
-      )
-      .insert({
-        mailroom_conversation_id:
-          mailroomConversationId,
-
-        outlook_message_id:
-          outlookMessageId,
-
-        action_type:
-          actionType,
-
-        proposed_value:
-          defaultProposedValue,
-
-        approved_value:
-          finalValue,
-
-        status:
-          "approved",
-      });
-
-  if (
-    insertError
-  ) {
-    throw new Error(
-      `Could not save ${actionType}: ${insertError.message}`
-    );
   }
 }
 
@@ -583,186 +500,108 @@ export async function POST(
         true;
     }
 
+    if (!effectiveRunId) {
+      throw new Error("Could not determine effective Mailroom run ID.");
+    }
+
     for (
       const item
       of payload.conversations
     ) {
-      /*
-       * Both may be false, but they may never both be true.
-       */
-      if (
-        item.needsAction &&
-        item.archive
-      ) {
-        throw new Error(
-          `Conversation "${item.conversationId}" cannot be both Needs Action and Archive.`
-        );
+      if (!isRequestedAction(item.requestedAction)) {
+        throw new Error(`Conversation "${item.conversationId}" has an unsupported requested action.`);
       }
-if (!effectiveRunId) {
-  throw new Error("Could not determine effective Mailroom run ID.");
-}
+
       const mailroomConversationId =
         await ensureMailroomConversation(
           effectiveRunId,
           item
         );
 
+      const currentRecord = await loadSourceConversation(mailroomConversationId);
+
+      await saveSelectedAction(
+        mailroomConversationId,
+        item.requestedAction,
+        currentRecord?.recommended_action ?? item.originalRequestedAction,
+        "proxy_ui"
+      );
+
+      const categoryChanged =
+        item.bucket !==
+        item.originalBucket;
+
+      const hasFeedback =
+        item.feedback
+          .trim()
+          .length >
+        0;
+
       if (
-        !item.systemType
+        categoryChanged ||
+        hasFeedback
       ) {
-        /*
-         * For a copied, previously reviewed item, use the
-         * original reviewed value as proposed_value.
-         *
-         * That preserves whether a false Needs Action value
-         * represents an actual change that Power Automate
-         * should undo.
-         */
-        await saveAction(
-          mailroomConversationId,
-          item.latestMessageId,
-          "needs_action",
-          item.needsAction,
-          item.originalNeedsAction
-        );
-
-        await saveAction(
-          mailroomConversationId,
-          item.latestMessageId,
-          "archive",
-          item.archive,
-          item.originalArchive
-        );
-
-        const categoryChanged =
-          item.bucket !==
-          item.originalBucket;
-
-        const needsActionChanged =
-          item.needsAction !==
-          item.originalNeedsAction;
-
-        const archiveChanged =
-          item.archive !==
-          item.originalArchive;
-
-        const hasFeedback =
-          item.feedback
-            .trim()
-            .length >
-          0;
-
-        if (
-          categoryChanged ||
-          needsActionChanged ||
-          archiveChanged ||
-          hasFeedback
-        ) {
-          const {
-            error:
-              feedbackError,
-          } =
-            await supabaseServer
-              .from(
-                "mailroom_feedback"
-              )
-              .insert({
-                mailroom_conversation_id:
-                  mailroomConversationId,
-
-                feedback_text:
-                  item.feedback.trim() ||
-                  null,
-
-                original_category:
-                  categoryToDatabase(
-                    item.originalBucket
-                  ),
-
-                corrected_category:
-                  categoryToDatabase(
-                    item.bucket
-                  ),
-
-                original_needs_action:
-                  item.originalNeedsAction,
-
-                corrected_needs_action:
-                  item.needsAction,
-
-                original_archive:
-                  item.originalArchive,
-
-                corrected_archive:
-                  item.archive,
-              });
-
-          if (
-            feedbackError
-          ) {
-            throw new Error(
-              `Could not save Mailroom feedback: ${feedbackError.message}`
-            );
-          }
-        }
-
         const {
           error:
-            categoryError,
+            feedbackError,
         } =
           await supabaseServer
             .from(
-              "mailroom_conversations"
+              "mailroom_feedback"
             )
-            .update({
-              category:
+            .insert({
+              mailroom_conversation_id:
+                mailroomConversationId,
+
+              feedback_text:
+                item.feedback.trim() ||
+                null,
+
+              original_category:
+                categoryToDatabase(
+                  item.originalBucket
+                ),
+
+              corrected_category:
                 categoryToDatabase(
                   item.bucket
                 ),
-            })
-            .eq(
-              "id",
-              mailroomConversationId
-            );
+            });
 
         if (
-          categoryError
+          feedbackError
         ) {
           throw new Error(
-            `Could not save corrected category: ${categoryError.message}`
+            `Could not save Mailroom feedback: ${feedbackError.message}`
           );
         }
       }
 
-      if (
-        item.systemType ===
-        "workday"
-      ) {
-        await saveAction(
-          mailroomConversationId,
-          item.latestMessageId,
-          "archive",
-          true
-        );
-      }
+      const {
+        error:
+          categoryError,
+      } =
+        await supabaseServer
+          .from(
+            "mailroom_conversations"
+          )
+          .update({
+            category:
+              categoryToDatabase(
+                item.bucket
+              ),
+          })
+          .eq(
+            "id",
+            mailroomConversationId
+          );
 
       if (
-        item.systemType ===
-        "calendar_response"
+        categoryError
       ) {
-        await saveAction(
-          mailroomConversationId,
-          item.latestMessageId,
-          "archive",
-          true
+        throw new Error(
+          `Could not save corrected category: ${categoryError.message}`
         );
-      }
-
-      if (
-        item.systemType ===
-        "meeting_request"
-      ) {
-        // Intentionally no execution action.
       }
     }
 

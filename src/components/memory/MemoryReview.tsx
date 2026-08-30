@@ -12,6 +12,7 @@ import {
   Database,
   Mail,
   Pencil,
+  Radar,
   X,
 } from "lucide-react";
 
@@ -596,6 +597,20 @@ export default function MemoryReview({
                   )}
                 </div>
               </div>
+            )}
+
+            {(currentItem.claimId || currentItem.entityId) && (
+              <a
+                href={`/inspector-general?objectType=${
+                  currentItem.claimId ? "memory_claim" : "memory_entity"
+                }&objectId=${currentItem.claimId ?? currentItem.entityId}`}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-3 inline-flex items-center gap-1.5 text-xs text-neutral-600 hover:text-neutral-400"
+              >
+                <Radar className="h-3 w-3" />
+                Why did Proxy ask this?
+              </a>
             )}
           </div>
 

@@ -1,0 +1,11 @@
+-- teams_messages was the one table in the project with RLS disabled
+-- (flagged by the Supabase security advisor). Verified before enabling:
+-- the entire codebase has exactly one Supabase client factory
+-- (src/lib/supabase/server.ts, gated with `import "server-only"`), always
+-- constructed with SUPABASE_SERVICE_ROLE_KEY, and every teams_messages
+-- reference (src/lib/memory/{ingestTeamsMessage,processTeamsConversationDelta,
+-- processTeamsSyncRun,backfillTeamsMessages}.ts) goes through it. No anon
+-- key exists anywhere in the codebase or .env.local, and there is no
+-- browser-side Supabase client. RLS with no policies is therefore safe,
+-- matching every other table in this project.
+alter table public.teams_messages enable row level security;

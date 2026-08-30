@@ -1,9 +1,12 @@
 "use client";
 
 import {
+  useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
+import { useRouter } from "next/navigation";
 
 import {
   Archive,
@@ -19,7 +22,6 @@ import {
   Mail,
   Newspaper,
   Sparkles,
-  SquareCheckBig,
 } from "lucide-react";
 
 import type {
@@ -29,6 +31,26 @@ import type {
 import type {
   MailroomReviewConversation,
 } from "@/lib/mailroom/loadLatestMailroomRun";
+
+import {
+  availableActions,
+  defaultRequestedAction,
+  ACTION_LABELS,
+  type RequestedAction,
+} from "@/lib/mailroom/actionModel";
+
+const BUCKET_TO_CATEGORY_UI: Record<MailroomBucket, "needs_you" | "fyi" | "professional_news" | "low_value" | "calendar" | "workday"> = {
+  "Needs You": "needs_you",
+  FYI: "fyi",
+  "Professional News": "professional_news",
+  "Low Value": "low_value",
+  Calendar: "calendar",
+  Workday: "workday",
+};
+
+function defaultRequestedActionForUi(bucket: MailroomBucket, isMeetingInvitation: boolean): RequestedAction {
+  return defaultRequestedAction(BUCKET_TO_CATEGORY_UI[bucket], isMeetingInvitation);
+}
 
 type Props = {
   initialConversations:
@@ -94,21 +116,6 @@ function BucketIcon({
   }
 }
 
-function defaultActionsForBucket(
-  bucket: MailroomBucket
-) {
-  const needsAction =
-    bucket ===
-    "Needs You";
-
-  return {
-    needsAction,
-
-    archive:
-      !needsAction,
-  };
-}
-
 function formatDate(
   value: string | null
 ) {
@@ -142,6 +149,8 @@ export default function MailroomReview({
   initialConversations,
   runId,
 }: Props) {
+  const router = useRouter();
+
   const [
     conversations,
     setConversations,
@@ -223,6 +232,191 @@ export default function MailroomReview({
     useState<
       string | null
     >(null);
+
+  /*
+   * Reflects a Mailroom run that is progressing in the background
+   * (e.g. triggered by Power Automate, or from another tab/device)
+   * rather than one this tab itself is driving through approveReview.
+   */
+  const [
+    backgroundNotice,
+    setBackgroundNotice,
+  ] =
+    useState<
+      | {
+          type: "syncing" | "failed";
+          runId: string;
+          error?: string | null;
+        }
+      | null
+    >(null);
+
+  /*
+   * The most recently applied ready_for_review run id, kept in sync
+   * with the `runId` prop. Used to detect when the background poll
+   * finds a NEWER ready_for_review run than the one on screen.
+   */
+  const appliedRunIdRef =
+    useRef(runId);
+
+  const refreshPendingRef =
+    useRef(false);
+
+  const lastFailedRunIdShownRef =
+    useRef<string | null>(null);
+
+  /*
+   * When the server hands this component a new runId (after a
+   * router.refresh(), or on first load), reset local review state
+   * to match. Only fires on a genuine run change, so in-progress
+   * edits survive background polls that don't find anything new.
+   */
+  useEffect(
+    () => {
+      if (runId !== appliedRunIdRef.current) {
+        appliedRunIdRef.current = runId;
+        refreshPendingRef.current = false;
+
+        setConversations(initialConversations);
+        setDirtyConversationIds({});
+        setReviewComplete(false);
+        setBackgroundNotice(null);
+      }
+    },
+    [runId, initialConversations],
+  );
+
+  /*
+   * Background polling so an already-open Mailroom page notices a
+   * run that reaches ready_for_review without a manual refresh —
+   * whether that run was started by this tab, another tab/device,
+   * or Power Automate directly.
+   *
+   * Paused while this tab is already mid-flow (saving/analyzing/
+   * executing already poll run-status for that specific run).
+   */
+  useEffect(
+    () => {
+      if (saving || analyzing || executing) {
+        return;
+      }
+
+      let cancelled = false;
+
+      async function poll() {
+        if (
+          cancelled ||
+          document.visibilityState !== "visible"
+        ) {
+          return;
+        }
+
+        try {
+          const response = await fetch(
+            "/api/mailroom/latest-run-status",
+            { cache: "no-store" },
+          );
+
+          const result = await response.json();
+
+          if (!response.ok || !result.success || !result.run) {
+            return;
+          }
+
+          const run = result.run as {
+            id: string;
+            status: string;
+            errorMessage: string | null;
+          };
+
+          if (cancelled) {
+            return;
+          }
+
+          if (run.status === "ready_for_review") {
+            if (
+              run.id !== appliedRunIdRef.current &&
+              !refreshPendingRef.current
+            ) {
+              refreshPendingRef.current = true;
+              setBackgroundNotice(null);
+              router.refresh();
+            }
+            return;
+          }
+
+          if (
+            run.status === "processing" ||
+            run.status === "executing" ||
+            run.status === "approved"
+          ) {
+            if (run.id !== appliedRunIdRef.current) {
+              setBackgroundNotice({
+                type: "syncing",
+                runId: run.id,
+              });
+            }
+            return;
+          }
+
+          if (run.status === "failed") {
+            if (
+              run.id !== appliedRunIdRef.current &&
+              lastFailedRunIdShownRef.current !== run.id
+            ) {
+              lastFailedRunIdShownRef.current = run.id;
+              setBackgroundNotice({
+                type: "failed",
+                runId: run.id,
+                error: run.errorMessage,
+              });
+            }
+            return;
+          }
+
+          /*
+           * "completed" (execution finished, next analysis not
+           * yet visible) or any other terminal state — nothing
+           * actionable yet, clear a stale syncing banner.
+           */
+          setBackgroundNotice(
+            (current) =>
+              current?.type === "syncing" ? null : current,
+          );
+        } catch {
+          /*
+           * A transient network error here should not disrupt
+           * review — the next poll tick will retry.
+           */
+        }
+      }
+
+      poll();
+
+      const intervalId = setInterval(poll, 10000);
+
+      function onVisible() {
+        if (document.visibilityState === "visible") {
+          poll();
+        }
+      }
+
+      document.addEventListener(
+        "visibilitychange",
+        onVisible,
+      );
+
+      return () => {
+        cancelled = true;
+        clearInterval(intervalId);
+        document.removeEventListener(
+          "visibilitychange",
+          onVisible,
+        );
+      };
+    },
+    [saving, analyzing, executing, router],
+  );
 
   /*
    * Tracks previously reviewed Inbox items that Dave edits
@@ -397,82 +591,22 @@ export default function MailroomReview({
     bucket:
       MailroomBucket
   ) {
-    const defaults =
-      defaultActionsForBucket(
-        bucket
-      );
-
     updateConversation(
       conversationId,
       {
         bucket,
-
-        needsAction:
-          defaults.needsAction,
-
-        archive:
-          defaults.archive,
+        requestedAction: defaultRequestedActionForUi(bucket, false),
       }
     );
   }
 
-  function changeNeedsAction(
-    conversationId:
-      string,
-
-    checked:
-      boolean
+  function changeRequestedAction(
+    conversationId: string,
+    requestedAction: RequestedAction
   ) {
     updateConversation(
       conversationId,
-      {
-        needsAction:
-          checked,
-
-        /*
-         * Only force Archive off
-         * when Needs Action is
-         * actively checked.
-         *
-         * If Needs Action is
-         * unchecked, both may
-         * remain false.
-         */
-        ...(checked
-          ? {
-              archive:
-                false,
-            }
-          : {}),
-      }
-    );
-  }
-
-  function changeArchive(
-    conversationId:
-      string,
-
-    checked:
-      boolean
-  ) {
-    updateConversation(
-      conversationId,
-      {
-        archive:
-          checked,
-
-        /*
-         * Only force Needs Action
-         * off when Archive is
-         * actively checked.
-         */
-        ...(checked
-          ? {
-              needsAction:
-                false,
-            }
-          : {}),
-      }
+      { requestedAction }
     );
   }
 
@@ -518,7 +652,7 @@ export default function MailroomReview({
         conversation
       ) =>
         !conversation.systemType &&
-        conversation.needsAction
+        conversation.requestedAction === "needs_attention"
     ).length;
 
   const archiveCount =
@@ -527,7 +661,7 @@ export default function MailroomReview({
         conversation
       ) =>
         !conversation.systemType &&
-        conversation.archive
+        conversation.requestedAction === "archive"
     ).length;
 
   function wait(
@@ -723,17 +857,14 @@ export default function MailroomReview({
                       originalBucket:
                         conversation.originalBucket,
 
-                      needsAction:
-                        conversation.needsAction,
+                      requestedAction:
+                        conversation.requestedAction,
 
-                      originalNeedsAction:
-                        conversation.originalNeedsAction,
+                      originalRequestedAction:
+                        conversation.originalRequestedAction,
 
-                      archive:
-                        conversation.archive,
-
-                      originalArchive:
-                        conversation.originalArchive,
+                      isMeetingInvitation:
+                        conversation.isMeetingInvitation,
 
                       feedback:
                         conversation.feedback,
@@ -891,6 +1022,19 @@ export default function MailroomReview({
               This screen will refresh automatically when Power Automate is finished.
             </p>
           </div>
+        </div>
+      )}
+
+      {!executing && backgroundNotice?.type === "syncing" && (
+        <div className="flex items-center gap-2 rounded-lg border border-blue-900/40 bg-blue-950/20 px-4 py-2 text-xs text-blue-300">
+          <Sparkles className="h-3.5 w-3.5 animate-pulse" />
+Proxy is syncing Mailroom in the background — this page will update automatically when it's ready.
+        </div>
+      )}
+
+      {!executing && backgroundNotice?.type === "failed" && (
+        <div className="rounded-lg border border-red-900/50 bg-red-950/30 px-4 py-2 text-xs text-red-300">
+          A background Mailroom run failed{backgroundNotice.error ? `: ${backgroundNotice.error}` : "."}
         </div>
       )}
 
@@ -1501,56 +1645,25 @@ export default function MailroomReview({
                                       )}
                                     </select>
 
-                                    <label className="flex cursor-pointer items-center gap-2 text-sm text-neutral-400">
-                                      <input
-                                        type="checkbox"
-                                        checked={
-                                          conversation.needsAction
-                                        }
-                                        disabled={
-                                          saving ||
-                                          analyzing
-                                        }
-                                        onChange={(
-                                          event
-                                        ) =>
-                                          changeNeedsAction(
+                                    <label className="flex items-center gap-2 text-sm text-neutral-400">
+                                      Action:
+                                      <select
+                                        value={conversation.requestedAction}
+                                        disabled={saving || analyzing}
+                                        onChange={(event) =>
+                                          changeRequestedAction(
                                             conversation.conversationId,
-                                            event.target.checked
+                                            event.target.value as RequestedAction
                                           )
                                         }
-                                        className="h-4 w-4 accent-blue-500"
-                                      />
-
-                                      <SquareCheckBig className="h-4 w-4" />
-
-                                      Needs Action
-                                    </label>
-
-                                    <label className="flex cursor-pointer items-center gap-2 text-sm text-neutral-400">
-                                      <input
-                                        type="checkbox"
-                                        checked={
-                                          conversation.archive
-                                        }
-                                        disabled={
-                                          saving ||
-                                          analyzing
-                                        }
-                                        onChange={(
-                                          event
-                                        ) =>
-                                          changeArchive(
-                                            conversation.conversationId,
-                                            event.target.checked
-                                          )
-                                        }
-                                        className="h-4 w-4 accent-blue-500"
-                                      />
-
-                                      <Archive className="h-4 w-4" />
-
-                                      Archive
+                                        className="rounded-md border border-neutral-800 bg-neutral-950 px-2 py-1 text-sm text-neutral-200"
+                                      >
+                                        {availableActions(conversation.isMeetingInvitation).map((action) => (
+                                          <option key={action} value={action}>
+                                            {ACTION_LABELS[action]}
+                                          </option>
+                                        ))}
+                                      </select>
                                     </label>
 
                                     <input

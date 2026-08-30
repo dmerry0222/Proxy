@@ -22,6 +22,46 @@ import type {
   MailConversation,
   MailroomBucket,
 } from "@/lib/mailroom/types";
+import { defaultRequestedAction, type MailroomCategory } from "@/lib/mailroom/actionModel";
+import { isActionableMeetingInvitation } from "@/lib/mailroom/normalizeOutlookMetadata";
+
+const MAILBOX_OWNER_EMAIL = "dmerry@suffolk.edu";
+
+/**
+ * A conversation is a positively-identified, actionable live invitation
+ * only via the shared deterministic structural predicate -- never from
+ * AI/text heuristics, and never for forwarded meeting mail, responses,
+ * or cancellations. See isActionableMeetingInvitation for the full gate.
+ */
+function detectMeetingInvitation(conversation: MailConversation): boolean {
+  const latest =
+    conversation.messages.find((message) => message.outlookMessageId === conversation.latestMessageId) ??
+    conversation.messages[conversation.messages.length - 1];
+  if (!latest) return false;
+  return isActionableMeetingInvitation(
+    {
+      calendarMessageKind: latest.calendarMessageKind as "meeting_response" | "meeting_message" | "cancellation" | null,
+      calendarAction: latest.calendarAction as "accepted" | "declined" | "tentative" | "cancelled" | null,
+      calendarSeriesInstanceId: latest.calendarSeriesInstanceId,
+      isMeetingForward: latest.isMeetingForward,
+      direction: latest.direction,
+      subject: latest.subject,
+      toRecipients: latest.toRecipients,
+      ccRecipients: latest.ccRecipients,
+      isInInbox: latest.isInInbox,
+    },
+    MAILBOX_OWNER_EMAIL
+  );
+}
+
+const BUCKET_TO_CATEGORY: Record<MailroomBucket, MailroomCategory> = {
+  "Needs You": "needs_you",
+  FYI: "fyi",
+  "Professional News": "professional_news",
+  "Low Value": "low_value",
+  Calendar: "calendar",
+  Workday: "workday",
+};
 
 const anthropic =
   new Anthropic({
@@ -47,6 +87,9 @@ export type MailroomAnalysis = {
 
   reasoningNote:
     string;
+
+  isMeetingInvitation:
+    boolean;
 };
 
 type OrgChartPerson = {
@@ -286,6 +329,16 @@ function buildConversationText(
             ? "System noise: yes"
             : "System noise: no";
 
+        const normalizedMetadata = [
+          `Calendar related: ${message.isCalendarRelated ? "yes" : "no"}`,
+          `Calendar kind: ${message.calendarMessageKind ?? "none"}`,
+          `Calendar action: ${message.calendarAction ?? "none"}`,
+          `Automatic reply: ${message.isAutoReply ? "yes" : "no"}`,
+          `Mailing list: ${message.isMailingList ? "yes" : "no"}`,
+          `List ID: ${message.listId ?? "none"}`,
+          `System generated: ${message.isSystemGenerated ? "yes" : "no"}`,
+        ];
+
         const normalizedSubject =
           normalizeSubject(
             message.subject
@@ -299,6 +352,7 @@ function buildConversationText(
           `Normalized subject: ${normalizedSubject}`,
           `Original subject: ${message.subject ?? "(No subject)"}`,
           noiseLabel,
+          ...normalizedMetadata,
           "",
           message.bodyPreview ??
             "(No message text available)",
@@ -311,18 +365,10 @@ function buildConversationText(
 }
 
 function defaultActionsForCategory(
-  category: MailroomBucket
+  category: MailroomBucket,
+  isMeetingInvitation: boolean
 ) {
-  const needsAction =
-    category ===
-    "Needs You";
-
-  return {
-    needsAction,
-
-    archive:
-      !needsAction,
-  };
+  return defaultRequestedAction(BUCKET_TO_CATEGORY[category], isMeetingInvitation);
 }
 
 export async function analyzeMailroomConversation(
@@ -334,6 +380,45 @@ export async function analyzeMailroomConversation(
     > =
       new Map()
 ): Promise<MailroomAnalysis> {
+  if (conversation.systemType === "workday") {
+    return {
+      category: "Workday",
+      summary: conversation.summary || `Workday notification: ${conversation.subject}`,
+      requiresAttention: false,
+      confidence: 0.99,
+      suggestedReply: null,
+      reasoningNote: "Deterministic Workday routing (sender domain), kept separate from Calendar.",
+      isMeetingInvitation: false,
+    };
+  }
+
+  if (conversation.isCalendarRelated) {
+    const isMeetingInvitation = detectMeetingInvitation(conversation);
+    return {
+      category: "Calendar",
+      summary: conversation.summary || `Calendar activity: ${conversation.subject}`,
+      requiresAttention: false,
+      confidence: 0.99,
+      suggestedReply: null,
+      reasoningNote: isMeetingInvitation
+        ? "Deterministic Calendar routing: positively identified meeting invitation (structured Graph fields)."
+        : "Deterministic Calendar routing from normalized Outlook metadata.",
+      isMeetingInvitation,
+    };
+  }
+
+  if (conversation.isAutoReply) {
+    return {
+      category: "Low Value",
+      summary: conversation.summary || `Automatic reply: ${conversation.subject}`,
+      requiresAttention: false,
+      confidence: 0.98,
+      suggestedReply: null,
+      reasoningNote: "Deterministic automatic-reply default from normalized Outlook metadata.",
+      isMeetingInvitation: false,
+    };
+  }
+
   if (
     !process.env
       .ANTHROPIC_API_KEY
@@ -572,6 +657,14 @@ ${conversation.subject}
 Current sender:
 ${currentSender}
 
+NORMALIZED OUTLOOK METADATA:
+Calendar related: ${conversation.isCalendarRelated ? "yes" : "no"}
+Automatic reply: ${conversation.isAutoReply ? "yes" : "no"}
+Mailing list: ${conversation.isMailingList ? "yes" : "no"}
+List ID: ${conversation.listId ?? "none"}
+
+Mailing-list status is a strong broadcast signal. Use it to distinguish direct correspondence from Professional News or Low Value, but still judge the actual content.
+
 Latest substantive message ID:
 ${conversation.latestSubstantiveMessageId ?? "None identified"}
 
@@ -704,6 +797,8 @@ ${conversationText}
       "string"
         ? analysis.reasoningNote
         : "",
+
+    isMeetingInvitation: false,
   };
 }
 
@@ -852,6 +947,25 @@ export async function runMailroomAnalysis() {
 
             suggested_reply:
               analysis.suggestedReply,
+
+            received_at:
+              conversation.latestMessageAt,
+
+            is_meeting_invitation:
+              analysis.isMeetingInvitation,
+
+            requested_action:
+              defaultActionsForCategory(analysis.category, analysis.isMeetingInvitation),
+
+            /*
+             * The recommendation is recorded alongside the initial
+             * selection so a later human override stays measurable
+             * against what Proxy originally proposed.
+             */
+            recommended_action:
+              defaultActionsForCategory(analysis.category, analysis.isMeetingInvitation),
+
+            selected_action_source: "default",
           })
           .select("id")
           .single();
@@ -868,125 +982,6 @@ export async function runMailroomAnalysis() {
         );
       }
 
-      const mailroomConversationId =
-        mailroomConversation.id;
-
-      const latestInboxMessageId =
-        [
-          ...conversation.messages,
-        ]
-          .reverse()
-          .find(
-            (message) =>
-              message.isInInbox ===
-              true
-          )
-          ?.outlookMessageId ??
-        null;
-
-      const defaults =
-        defaultActionsForCategory(
-          analysis.category
-        );
-
-      const actionRows: {
-        mailroom_conversation_id:
-          string;
-
-        outlook_message_id:
-          string;
-
-        action_type:
-          string;
-
-        proposed_value:
-          boolean;
-      }[] = [];
-
-      /*
-       * Older Inbox copies in the same
-       * conversation are always archived.
-       */
-      for (
-        const messageId
-        of conversation.inboxMessageIds
-      ) {
-        if (
-          messageId !==
-          latestInboxMessageId
-        ) {
-          actionRows.push({
-            mailroom_conversation_id:
-              mailroomConversationId,
-
-            outlook_message_id:
-              messageId,
-
-            action_type:
-              "archive",
-
-            proposed_value:
-              true,
-          });
-        }
-      }
-
-      if (
-        latestInboxMessageId
-      ) {
-        actionRows.push({
-          mailroom_conversation_id:
-            mailroomConversationId,
-
-          outlook_message_id:
-            latestInboxMessageId,
-
-          action_type:
-            "archive",
-
-          proposed_value:
-            defaults.archive,
-        });
-
-        actionRows.push({
-          mailroom_conversation_id:
-            mailroomConversationId,
-
-          outlook_message_id:
-            latestInboxMessageId,
-
-          action_type:
-            "needs_action",
-
-          proposed_value:
-            defaults.needsAction,
-        });
-      }
-
-      if (
-        actionRows.length >
-        0
-      ) {
-        const {
-          error:
-            actionError,
-        } =
-          await supabaseServer
-            .from(
-              "mailroom_actions"
-            )
-            .insert(
-              actionRows
-            );
-
-        if (
-          actionError
-        ) {
-          throw new Error(
-            `Could not save actions for "${conversation.subject}": ${actionError.message}`
-          );
-        }
-      }
     }
 
     const {

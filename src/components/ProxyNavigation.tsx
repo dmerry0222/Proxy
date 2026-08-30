@@ -7,6 +7,7 @@ import {
   Inbox,
   ListChecks,
   BrainCircuit,
+  Radar,
 } from "lucide-react";
 
 const navigation = [
@@ -30,13 +31,18 @@ const navigation = [
     href: "/memory",
     icon: BrainCircuit,
   },
+  {
+    name: "Inspector General",
+    href: "/inspector-general",
+    icon: Radar,
+  },
 ];
 
-export default function ProxyNavigation() {
+export default function ProxyNavigation({ compact = false }: { compact?: boolean }) {
   const pathname = usePathname();
 
   return (
-    <nav className="space-y-1">
+    <nav className={compact ? "flex items-center justify-around" : "space-y-1"}>
       {navigation.map((item) => {
         const Icon = item.icon;
 
@@ -50,7 +56,8 @@ export default function ProxyNavigation() {
             key={item.href}
             href={item.href}
             className={[
-              "flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition",
+              "flex items-center rounded-lg text-sm transition",
+              compact ? "flex-col gap-1 px-2 py-2 text-[10px]" : "gap-3 px-3 py-2",
               active
                 ? "bg-neutral-900 text-neutral-100"
                 : "text-neutral-500 hover:bg-neutral-900 hover:text-neutral-200",
