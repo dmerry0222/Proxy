@@ -8,13 +8,19 @@ import type { DataSourcePropertySchema } from "./executeSchema";
  * it, so modeling it here would just be a checkbox with no real state
  * behind it.
  *
- * Review Status / Human Reply Edit / Human Instruction are the
- * human/Notion-owned fields (Brief Part 4): they're seeded with a default
- * on first page creation and never included in later update payloads (see
- * buildCreateOnlyProperties usage in syncMailroom.ts) -- Proxy has no
- * canonical source for them until the submit webhook + reconciliation
- * (Part 4/5) exists, so overwriting them on every re-sync would erase real
- * human input.
+ * Three ownership models are in play here:
+ *
+ *  - PROXY-OWNED (Conversation, Sender, Summary, Date Received, ...):
+ *    rewritten from canonical state on every sync.
+ *  - HUMAN-OWNED (Human Reply Edit, Human Instruction, Submitted,
+ *    Execution Status): seeded once on page creation and never included in
+ *    a later update payload (see buildCreateOnlyProperties in
+ *    syncMailroom.ts), so a re-sync cannot erase real human input or
+ *    re-arm a pending execution.
+ *  - GUARDED (Bucket, Requested Action): Proxy proposes them and keeps
+ *    them current, but stops writing whichever one a human has changed
+ *    until that change is submitted and reconciled. See
+ *    guardedProperties.ts for why the middle state is necessary.
  */
 export const MAILROOM_PROPERTIES: DataSourcePropertySchema = {
   Conversation: { type: "title", title: {} },
@@ -33,15 +39,6 @@ export const MAILROOM_PROPERTIES: DataSourcePropertySchema = {
     },
   },
   Summary: { type: "rich_text", rich_text: {} },
-  // "Needs Action"/"Archive"/"Recommended Action"/"Calendar-related" are
-  // retired in favor of the single "Requested Action" select below (Build:
-  // Mailroom Action Model). Left in the schema (unwritten going forward,
-  // not deleted) so old Notion views referencing them don't break, and so
-  // no destructive Notion schema change is needed.
-  "Needs Action": { type: "checkbox", checkbox: {} },
-  "Recommended Action": { type: "rich_text", rich_text: {} },
-  Archive: { type: "checkbox", checkbox: {} },
-  "Calendar-related": { type: "checkbox", checkbox: {} },
   "Requested Action": {
     type: "select",
     select: {
@@ -65,10 +62,45 @@ export const MAILROOM_PROPERTIES: DataSourcePropertySchema = {
   "Suggested Reply": { type: "rich_text", rich_text: {} },
   "Human Reply Edit": { type: "rich_text", rich_text: {} },
   "Human Instruction / Feedback": { type: "rich_text", rich_text: {} },
-  "Review Status": {
-    type: "select",
-    select: { options: [{ name: "Reviewing" }, { name: "Submitted" }, { name: "Executing" }, { name: "Done" }, { name: "Error" }] },
-  },
+  /**
+   * The human's "I'm done reviewing this row" signal, set by a per-row
+   * Notion button. Human/Notion-owned: seeded to false exactly once on page
+   * creation and never written by ordinary outgoing sync, so a re-sync can
+   * never un-submit a row Dave has already cleared from his review view.
+   *
+   * Note this is a REVIEW signal, not an EXECUTION signal -- "Execution
+   * Status" remains the only thing that arms Power Automate. Submitting a
+   * row tells Proxy to reconcile the reviewed values; it does not perform
+   * any Outlook mutation.
+   */
+  Submitted: { type: "checkbox", checkbox: {} },
   "Conversation ID": { type: "rich_text", rich_text: {} },
   "Outlook Message ID": { type: "rich_text", rich_text: {} },
 };
+
+/**
+ * Properties retired by the Mailroom Action Model build, superseded by the
+ * single "Requested Action" select.
+ *
+ * Deliberately ABSENT from MAILROOM_PROPERTIES rather than listed there.
+ * Notion's data source update only touches the properties named in the
+ * payload and never deletes the ones you omit, so leaving them out means
+ * they survive untouched in Notion -- existing views that still reference
+ * them keep working -- while the schema diff correctly reports them as
+ * legacy rather than as part of the contract. Nothing writes them: they
+ * appear in no buildProperties payload in syncMailroom.ts.
+ *
+ * Listed here (and not merely deleted from the file) so the migration
+ * report can name them and explain why they are still present, instead of
+ * a reader having to infer it from their absence.
+ */
+export const RETIRED_MAILROOM_PROPERTIES: { name: string; supersededBy: string }[] = [
+  { name: "Needs Action", supersededBy: "Requested Action = Needs Attention" },
+  { name: "Archive", supersededBy: "Requested Action = Archive" },
+  { name: "Recommended Action", supersededBy: "Requested Action (plus mailroom_feedback for the original recommendation)" },
+  { name: "Calendar-related", supersededBy: "Bucket = Calendar" },
+  {
+    name: "Review Status",
+    supersededBy: "Submitted (review) and Execution Status (execution)",
+  },
+];

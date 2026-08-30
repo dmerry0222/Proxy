@@ -5,6 +5,7 @@ import { loadLatestMailroomRun, type MailroomReviewConversation } from "@/lib/ma
 import { ensureMailroomWorkspace } from "./ensureWorkspace";
 import { getSurfaceMapping } from "./mapping";
 import {
+  checkboxProperty,
   dateProperty,
   emptyCounts,
   richTextProperty,
@@ -16,6 +17,7 @@ import {
 } from "./pageSync";
 import type { NotionWorkspaceDatabaseKey } from "./types";
 import { ACTION_LABELS } from "@/lib/mailroom/actionModel";
+import { migrateMailroomSchema, type MailroomSchemaMigrationReport } from "./migrateMailroomSchema";
 
 export type MailroomWorkspaceStatus = {
   key: NotionWorkspaceDatabaseKey;
@@ -29,9 +31,22 @@ export type MailroomSyncSummary = {
   totalConversations: number;
   consideredConversations: number;
   workspace: MailroomWorkspaceStatus[];
+  /**
+   * Result of bringing the live Notion schema into compliance before any
+   * page is written. Reported rather than silently performed: a page push
+   * that names a property Notion doesn't have fails the whole page, so a
+   * failed migration is the most likely explanation for a failed sync.
+   */
+  schemaMigration: MailroomSchemaMigrationReport | null;
   conversations: ObjectSyncCounts;
   errors: SyncError[];
 };
+
+/**
+ * Properties Proxy proposes but Dave may override in Notion during review.
+ * Exported so the submission path releases exactly the same set it guards.
+ */
+export const MAILROOM_GUARDED_PROPERTIES = ["Bucket", "Requested Action"];
 
 async function resolveWorkspace(dryRun: boolean): Promise<{ status: MailroomWorkspaceStatus; dataSourceId: string | null }> {
   if (!dryRun) {
@@ -53,11 +68,19 @@ async function resolveWorkspace(dryRun: boolean): Promise<{ status: MailroomWork
   };
 }
 
+/*
+ * Outlook stores a missing display name as an EMPTY STRING, not null --
+ * every message in this mailbox has from_name = "". The previous
+ * `senderName ?? senderEmail` fell through to "" (?? only catches
+ * null/undefined), so the email address was discarded and Sender rendered
+ * blank on every Notion page. Treat blank as absent.
+ */
 function senderText(conversation: MailroomReviewConversation): string {
-  if (conversation.senderName && conversation.senderEmail) {
-    return `${conversation.senderName} <${conversation.senderEmail}>`;
-  }
-  return conversation.senderName ?? conversation.senderEmail ?? "";
+  const name = conversation.senderName?.trim() || null;
+  const email = conversation.senderEmail?.trim() || null;
+
+  if (name && email) return `${name} <${email}>`;
+  return name ?? email ?? "";
 }
 
 /**
@@ -66,14 +89,16 @@ function senderText(conversation: MailroomReviewConversation): string {
  * Mailroom UI already uses) into the Notion Mailroom database. One Notion
  * page per Outlook conversation, keyed by conversationId.
  *
- * Read-only projection only: this does not create the "Submit to Proxy"
- * automation (that's a manually-configured Notion automation watching
- * "Review Status", per Brief Part 2) and there is no inbound webhook yet
- * (Brief Part 4) -- a human editing Review Status / Human Reply Edit /
- * Human Instruction in Notion today has no effect on Proxy. Those fields
+ * Outbound projection: this does not create the per-row Submit button
+ * (a manual Notion setup step) and the button->Proxy webhook is not wired
+ * yet. Human Reply Edit / Human Instruction / Submitted / Execution Status
  * are seeded once on page creation and never touched again by this sync
  * (see buildCreateOnlyProperties below), so they're safe to write to by
  * hand without this sync clobbering them on the next run.
+ *
+ * Bucket and Requested Action are guarded rather than human-owned: Proxy
+ * keeps proposing them, but a human edit to either is preserved until it
+ * is submitted (see MAILROOM_GUARDED_PROPERTIES).
  *
  * `limit` bounds how many conversations are actually pushed in apply mode
  * (dry run always evaluates the full live set, since it never calls
@@ -97,6 +122,18 @@ export async function syncMailroomToNotion(options: {
     humanSummary: dryRun ? "Checked Mailroom workspace database (dry run)" : "Ensured Mailroom workspace database",
     metadata: { status: workspace.status },
   });
+
+  /*
+   * Bring the live schema into compliance BEFORE pushing pages. The
+   * best-effort patch inside ensureMailroomWorkspace swallows its errors so
+   * it can never block a sync; this call is the one that reads the schema
+   * back and reports what actually happened. Ordering matters: every page
+   * write below names "Requested Action" / "Date Received" / "Submitted",
+   * and Notion rejects a page write that references a property the data
+   * source doesn't have -- so a skipped migration would fail all 62 pages,
+   * not degrade gracefully.
+   */
+  const schemaMigration = await migrateMailroomSchema({ dryRun, traceId });
 
   const { conversations: allConversations } = await loadLatestMailroomRun();
   const conversations = dryRun || limit === null ? allConversations : allConversations.slice(0, limit);
@@ -134,14 +171,24 @@ export async function syncMailroomToNotion(options: {
         "Conversation ID": richTextProperty(conversation.conversationId),
         "Outlook Message ID": richTextProperty(canonicalFields.outlookMessageId),
       }),
+      /*
+       * Bucket and Requested Action are Proxy proposals that Dave edits
+       * during review. Guarding them means a sweep landing between his edit
+       * and his Submit press preserves the edit instead of reverting it.
+       * Submission clears the guard (see reconcileNotionSubmission), so
+       * Proxy resumes ownership once the value is canonical.
+       */
+      guardedProperties: MAILROOM_GUARDED_PROPERTIES,
       buildCreateOnlyProperties: () => ({
-        "Review Status": selectProperty("Reviewing"),
         "Human Reply Edit": richTextProperty(null),
         "Human Instruction / Feedback": richTextProperty(null),
         // Left empty on creation and never rewritten by sync -- only the
         // Notion button (human) sets it to "Requested", and only Power
         // Automate clears it. A re-sync must never re-arm an execution.
         "Execution Status": selectProperty(null),
+        // Human-owned review signal. Seeded false once; never written by
+        // sync again, so a resync cannot un-submit a reviewed row.
+        Submitted: checkboxProperty(false),
       }),
     });
 
@@ -157,6 +204,7 @@ export async function syncMailroomToNotion(options: {
     totalConversations: allConversations.length,
     consideredConversations: conversations.length,
     workspace: [workspace.status],
+    schemaMigration,
     conversations: counts,
     errors,
   };

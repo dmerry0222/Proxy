@@ -16,7 +16,11 @@
     "test:review-transitions": "node --experimental-strip-types --test test-review-transitions.mjs",
     "test:priority-policy": "node --experimental-strip-types --test test-priority-policy.mjs",
     "test:mailroom-action-model": "node --experimental-strip-types --test test-mailroom-action-model.mjs",
-    "test:invitation-gate": "node --experimental-strip-types --test test-invitation-gate.mjs"
+    "test:invitation-gate": "node --experimental-strip-types --test test-invitation-gate.mjs",
+    "test:schema-diff": "node --experimental-strip-types --test test-schema-diff.mjs",
+    "test:guarded-properties": "node --experimental-strip-types --test test-guarded-properties.mjs",
+    "test:external-artifact-request": "node --experimental-strip-types --test test-external-artifact-request.mjs",
+    "test:submission-reconciliation": "node --experimental-strip-types --test test-submission-reconciliation.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.120.0",
