@@ -28,7 +28,8 @@
     "test:claim-review-policy": "node --experimental-strip-types --test test-claim-review-policy.mjs",
     "test:pending-context-review-policy": "node --experimental-strip-types --test test-pending-context-review-policy.mjs",
     "test:claim-duplication-rules": "node --experimental-strip-types --test test-claim-duplication-rules.mjs",
-    "test:claim-consequence-policy": "node --experimental-strip-types --test test-claim-consequence-policy.mjs"
+    "test:claim-consequence-policy": "node --experimental-strip-types --test test-claim-consequence-policy.mjs",
+    "test:memory-review-queue": "node --experimental-strip-types --test test-memory-review-queue.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.120.0",

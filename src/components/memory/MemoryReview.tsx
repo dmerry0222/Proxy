@@ -5,6 +5,8 @@ import {
   useState,
 } from "react";
 
+import { useRouter } from "next/navigation";
+
 import {
   Check,
   CheckCircle2,
@@ -19,6 +21,11 @@ import {
 import type {
   MemoryReviewItem,
 } from "@/lib/memory/loadReviewItems";
+
+import {
+  selectActiveReviewQueue,
+  withResolved,
+} from "@/lib/memory/reviewQueue";
 
 type Props = {
   initialItems: MemoryReviewItem[];
@@ -253,8 +260,34 @@ function pendingLabel(
 export default function MemoryReview({
   initialItems,
 }: Props) {
-  const [items, setItems] =
-    useState(initialItems);
+  const router = useRouter();
+
+  /*
+   * Items are DERIVED from the server list minus what we've resolved in
+   * this session, rather than copied into state.
+   *
+   * `useState(initialItems)` ignored every subsequent server render, so a
+   * router.refresh() could never correct a stale queue. But naively
+   * resetting state from new props has the opposite failure: a refresh
+   * that lands before the write is visible would resurrect the card Dave
+   * just cleared. Filtering by resolved id gives both properties at once
+   * -- the card disappears instantly, and no later refresh can bring it
+   * back, because the filter outlives the fetch.
+   */
+  const [resolvedIds, setResolvedIds] =
+    useState<ReadonlySet<string>>(
+      () => new Set<string>()
+    );
+
+  const items =
+    useMemo(
+      () =>
+        selectActiveReviewQueue(
+          initialItems,
+          resolvedIds
+        ),
+      [initialItems, resolvedIds]
+    );
 
   const [saving, setSaving] =
     useState(false);
@@ -315,14 +348,28 @@ export default function MemoryReview({
         )
       : null;
 
-  function advance() {
-    setItems(
+  function advance(
+    resolvedId: string
+  ) {
+    setResolvedIds(
       (current) =>
-        current.slice(1)
+        withResolved(
+          current,
+          resolvedId
+        )
     );
 
     setCorrecting(false);
     setCorrectionText("");
+
+    /*
+     * Re-fetch the server component so the authoritative queue and the
+     * /memory pending-count CTA both reflect the mutation. The local
+     * filter above has already removed the card, so this reconciles
+     * rather than driving the visible transition -- no flicker, and no
+     * dependence on the refresh completing for the UI to feel correct.
+     */
+    router.refresh();
   }
 
   async function resolveItem(
@@ -387,7 +434,7 @@ export default function MemoryReview({
         );
       }
 
-      advance();
+      advance(currentItem.id);
     } catch (
       reviewError
     ) {
@@ -465,7 +512,7 @@ export default function MemoryReview({
         );
       }
 
-      advance();
+      advance(currentItem.id);
     } catch (
       reviewError
     ) {

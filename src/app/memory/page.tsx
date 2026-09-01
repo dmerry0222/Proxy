@@ -9,6 +9,13 @@ import {
   loadMemoryReviewItems,
 } from "@/lib/memory/loadReviewItems";
 
+/*
+ * Must match /memory/review: this page renders the pending COUNT from the
+ * same loader, so if one is static and the other dynamic the CTA and the
+ * queue disagree. Both are per-request.
+ */
+export const dynamic = "force-dynamic";
+
 export default async function MemoryPage() {
   const reviewItems =
     await loadMemoryReviewItems();

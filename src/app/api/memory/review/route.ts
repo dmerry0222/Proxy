@@ -194,6 +194,29 @@ if (isPendingAction) {
       result: data,
     });
   } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : "Unknown Memory review error";
+
+    /*
+     * Both resolve RPCs guard with `if status <> 'pending' then raise`.
+     * Hitting that is not a failure of Dave's intent -- the item is
+     * already out of the queue, which is exactly what he asked for. It
+     * happens on a double-click, a second open tab, or a stale card.
+     * Returning 500 here made the client's catch skip advance(), stranding
+     * a resolved item as the permanently-stuck active card. Report it as a
+     * success carrying `alreadyResolved` so the UI moves on, while still
+     * distinguishing it from a real mutation.
+     */
+    if (/already resolved or dismissed/i.test(message)) {
+      return NextResponse.json({
+        success: true,
+        alreadyResolved: true,
+        result: null,
+      });
+    }
+
     console.error(
       "Memory review failed:",
       error
@@ -202,10 +225,7 @@ if (isPendingAction) {
     return NextResponse.json(
       {
         success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Unknown Memory review error",
+        error: message,
       },
       { status: 500 }
     );
