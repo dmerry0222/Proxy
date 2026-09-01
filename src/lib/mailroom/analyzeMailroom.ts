@@ -4,6 +4,7 @@ import Anthropic from "@anthropic-ai/sdk";
 
 import {
   isSystemNoise,
+  loadMailroomConversationByConversationId,
   loadMailroomConversations,
   normalizeSubject,
 } from "@/lib/mailroom/loadMailroom";
@@ -982,6 +983,29 @@ export async function runMailroomAnalysis() {
         );
       }
 
+      /*
+       * Close the loop: this conversation's live Inbox messages must be
+       * marked processed now that they have a current analysis, or this
+       * exact selection query (includeProcessed: false) will pick the SAME
+       * conversation again on the very next call. Discovered the hard way
+       * -- an automated maintenance/backfill loop calling this function
+       * repeatedly re-analyzed and re-inserted the same 38 conversations
+       * 10 times in ~20 minutes before this fix, since nothing else in
+       * this function ever touched `processed`. A genuinely new Inbox
+       * message later flips this back to false via
+       * staleAnalysisRepair.ts's reopenStaleMailroomConversations, so this
+       * does not create a one-way "never analyzed again" trap.
+       */
+      const { error: markProcessedError } = await supabaseServer
+        .from("emails")
+        .update({ processed: true })
+        .in("outlook_message_id", conversation.inboxMessageIds);
+
+      if (markProcessedError) {
+        throw new Error(
+          `Analyzed "${conversation.subject}" but could not mark its Inbox messages processed: ${markProcessedError.message}`
+        );
+      }
     }
 
     const {
@@ -1047,4 +1071,120 @@ export async function runMailroomAnalysis() {
 
     throw error;
   }
+}
+
+export type ReconstructedMailroomAnalysis = {
+  mailroomConversationId: string;
+  conversation: {
+    id: string;
+    conversation_id: string;
+    category: string;
+    requested_action: string | null;
+    recommended_action: string | null;
+    suggested_reply: string | null;
+    is_meeting_invitation: boolean;
+    review_state: string | null;
+  };
+};
+
+/**
+ * Rebuilds a missing mailroom_conversations analysis row for one
+ * conversation that still has underlying email records -- e.g. the row was
+ * purged, or the conversation was never analyzed before this batch window
+ * moved past it. Reuses the same single-conversation analyzer and default
+ * action model as the batch run (runMailroomAnalysis), scoped to one
+ * conversation and its own single-conversation mailroom_runs record rather
+ * than a batch of 50.
+ *
+ * Returns null when there is nothing left to analyze (no email rows for
+ * this conversation) -- distinct from throwing, which means the email
+ * exists but analysis itself failed.
+ */
+export async function reconstructMailroomAnalysis(
+  conversationId: string
+): Promise<ReconstructedMailroomAnalysis | null> {
+  const conversation = await loadMailroomConversationByConversationId(conversationId);
+  if (!conversation) {
+    return null;
+  }
+
+  const peopleByEmail = await loadOrgChartPeople([conversation]);
+  const analysis = await analyzeMailroomConversation(conversation, peopleByEmail);
+
+  const { data: run, error: runError } = await supabaseServer
+    .from("mailroom_runs")
+    .insert({
+      status: "processing",
+      model_provider: "anthropic",
+      model_name: "claude-sonnet-4-5",
+      messages_considered: conversation.messages.length,
+      conversations_considered: 1,
+    })
+    .select("id")
+    .single();
+
+  if (runError || !run) {
+    throw new Error(`Could not create Mailroom reconstruction run: ${runError?.message ?? "Unknown error"}`);
+  }
+
+  const categoryForDatabase = analysis.category.toLowerCase().replaceAll(" ", "_");
+
+  const { data: mailroomConversation, error: conversationError } = await supabaseServer
+    .from("mailroom_conversations")
+    .insert({
+      run_id: run.id,
+      conversation_id: conversation.conversationId,
+      latest_message_id: conversation.latestMessageId,
+      item_type: "conversation",
+      category: categoryForDatabase,
+      summary: analysis.summary,
+      requires_attention: analysis.requiresAttention,
+      confidence: analysis.confidence,
+      suggested_reply: analysis.suggestedReply,
+      received_at: conversation.latestMessageAt,
+      is_meeting_invitation: analysis.isMeetingInvitation,
+      requested_action: defaultActionsForCategory(analysis.category, analysis.isMeetingInvitation),
+      recommended_action: defaultActionsForCategory(analysis.category, analysis.isMeetingInvitation),
+      selected_action_source: "default",
+    })
+    .select(
+      "id, conversation_id, category, requested_action, recommended_action, suggested_reply, is_meeting_invitation, review_state"
+    )
+    .single();
+
+  if (conversationError || !mailroomConversation) {
+    await supabaseServer
+      .from("mailroom_runs")
+      .update({
+        status: "failed",
+        completed_at: new Date().toISOString(),
+        error_message: conversationError?.message ?? "Unknown error",
+      })
+      .eq("id", run.id);
+    throw new Error(`Could not persist reconstructed Mailroom analysis: ${conversationError?.message ?? "Unknown error"}`);
+  }
+
+  await supabaseServer
+    .from("mailroom_runs")
+    .update({ status: "ready_for_review", completed_at: new Date().toISOString() })
+    .eq("id", run.id);
+
+  // Same reasoning as the batch loop in runMailroomAnalysis: without this,
+  // the next scheduled maintenance cycle would see this conversation's
+  // Inbox messages as still unprocessed and re-analyze/re-insert it again.
+  const { error: markProcessedError } = await supabaseServer
+    .from("emails")
+    .update({ processed: true })
+    .in("outlook_message_id", conversation.inboxMessageIds);
+
+  if (markProcessedError) {
+    throw new Error(
+      `Reconstructed analysis for "${conversation.subject}" but could not mark its Inbox messages processed: ${markProcessedError.message}`
+    );
+  }
+
+  return {
+    mailroomConversationId: mailroomConversation.id as string,
+    conversation: mailroomConversation as ReconstructedMailroomAnalysis["conversation"],
+  };
 }

@@ -2,6 +2,7 @@ import "server-only";
 
 import { emitDiagnosticEvent } from "@/lib/diagnostics/emitEvent";
 import { loadLatestMailroomRun, type MailroomReviewConversation } from "@/lib/mailroom/loadLatestMailroomRun";
+import { hasCurrentMailroomAnalysis } from "@/lib/mailroom/analysisReadiness";
 import { ensureMailroomWorkspace } from "./ensureWorkspace";
 import { getSurfaceMapping } from "./mapping";
 import {
@@ -40,6 +41,13 @@ export type MailroomSyncSummary = {
   schemaMigration: MailroomSchemaMigrationReport | null;
   conversations: ObjectSyncCounts;
   errors: SyncError[];
+  /**
+   * Live Inbox conversations that exist but were NOT projected because they
+   * have no current Mailroom analysis (never analyzed, or a newer thread
+   * message arrived since analysis ran) -- see analysisReadiness.ts. This
+   * is the Mailroom analysis backlog, not a sync failure.
+   */
+  backlogNotEligible: number;
 };
 
 /**
@@ -89,6 +97,16 @@ function senderText(conversation: MailroomReviewConversation): string {
  * Mailroom UI already uses) into the Notion Mailroom database. One Notion
  * page per Outlook conversation, keyed by conversationId.
  *
+ * ONLY conversations with a CURRENT stored analysis (hasCurrentAnalysis --
+ * see analysisReadiness.ts) are projected as reviewable rows. A live Inbox
+ * conversation loadLatestMailroomRun returns purely for the bespoke UI's
+ * display-continuity fallback (never analyzed, or analyzed against an
+ * older version of the thread) is NOT pushed here: Notion Mailroom means
+ * "Proxy has analyzed this and it is ready for review," not "this is in
+ * the Inbox." (Root cause of the Aug 2026 incident where Notion rows had
+ * "No Mailroom analysis exists" on Submit: this function used to push
+ * every live Inbox conversation unconditionally, fallback rows included.)
+ *
  * Outbound projection: this does not create the per-row Submit button
  * (a manual Notion setup step) and the button->Proxy webhook is not wired
  * yet. Human Reply Edit / Human Instruction / Submitted / Execution Status
@@ -136,7 +154,14 @@ export async function syncMailroomToNotion(options: {
   const schemaMigration = await migrateMailroomSchema({ dryRun, traceId });
 
   const { conversations: allConversations } = await loadLatestMailroomRun();
-  const conversations = dryRun || limit === null ? allConversations : allConversations.slice(0, limit);
+  const reviewableConversations = allConversations.filter((conversation) =>
+    hasCurrentMailroomAnalysis({
+      mailroomConversationId: conversation.mailroomConversationId,
+      analysisMessageId: conversation.analysisMessageId,
+      currentMessageId: conversation.latestMessageId,
+    })
+  );
+  const conversations = dryRun || limit === null ? reviewableConversations : reviewableConversations.slice(0, limit);
 
   const counts = emptyCounts();
   const errors: SyncError[] = [];
@@ -179,6 +204,11 @@ export async function syncMailroomToNotion(options: {
        * Proxy resumes ownership once the value is canonical.
        */
       guardedProperties: MAILROOM_GUARDED_PROPERTIES,
+      // A page this same function previously archived (see
+      // remediate-mailroom-projection) because it had no current analysis
+      // must reappear automatically the moment it becomes eligible again --
+      // it's Proxy's own archiving being undone, not a human's.
+      unarchiveOnUpdate: true,
       buildCreateOnlyProperties: () => ({
         "Human Reply Edit": richTextProperty(null),
         "Human Instruction / Feedback": richTextProperty(null),
@@ -207,5 +237,6 @@ export async function syncMailroomToNotion(options: {
     schemaMigration,
     conversations: counts,
     errors,
+    backlogNotEligible: allConversations.length - reviewableConversations.length,
   };
 }

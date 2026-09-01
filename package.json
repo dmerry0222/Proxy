@@ -20,7 +20,9 @@
     "test:schema-diff": "node --experimental-strip-types --test test-schema-diff.mjs",
     "test:guarded-properties": "node --experimental-strip-types --test test-guarded-properties.mjs",
     "test:external-artifact-request": "node --experimental-strip-types --test test-external-artifact-request.mjs",
-    "test:submission-reconciliation": "node --experimental-strip-types --test test-submission-reconciliation.mjs"
+    "test:submission-reconciliation": "node --experimental-strip-types --test test-submission-reconciliation.mjs",
+    "test:execution-target": "node --experimental-strip-types --test test-execution-target.mjs",
+    "test:analysis-readiness": "node --experimental-strip-types --test test-analysis-readiness.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.120.0",

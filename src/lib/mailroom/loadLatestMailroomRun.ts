@@ -11,8 +11,9 @@ import type {
   MailroomBucket,
 } from "@/lib/mailroom/types";
 import { defaultRequestedAction, isRequestedAction, type RequestedAction } from "@/lib/mailroom/actionModel";
+import { hasCurrentMailroomAnalysis } from "@/lib/mailroom/analysisReadiness";
 
-type StoredConversation = {
+export type StoredConversation = {
   id: string;
   run_id: string;
   conversation_id: string;
@@ -106,6 +107,20 @@ export type MailroomReviewConversation =
      */
     hasStoredAnalysis:
       boolean;
+
+    /** mailroom_conversations.latest_message_id for the stored analysis, if any. */
+    analysisMessageId:
+      string | null;
+
+    /**
+     * The one explicit, testable "is this actually reviewable" signal --
+     * see analysisReadiness.ts. False for both "never analyzed" and
+     * "analyzed, but a newer thread message has since arrived" -- unlike
+     * hasStoredAnalysis/isPendingReview, which exist for the bespoke
+     * Mailroom UI's display continuity and are deliberately more lenient.
+     */
+    hasCurrentAnalysis:
+      boolean;
   };
 
 async function loadStoredConversations(
@@ -192,6 +207,31 @@ async function loadStoredConversations(
   return rows;
 }
 
+/**
+ * Loads the durable Mailroom interpretation history for a set of Outlook
+ * conversation ids and reduces it to the single newest stored analysis per
+ * conversation. Exported so callers other than the display merge below
+ * (e.g. the pending-analysis backlog check) share the exact same "what is
+ * the current stored analysis for this conversation" logic rather than
+ * re-deriving it.
+ */
+export async function loadLatestStoredMailroomAnalyses(
+  conversationIds: string[]
+): Promise<Map<string, StoredConversation>> {
+  const storedConversations = await loadStoredConversations(conversationIds);
+
+  const latestByConversation = new Map<string, StoredConversation>();
+
+  for (const stored of storedConversations) {
+    const existing = latestByConversation.get(stored.conversation_id);
+    if (!existing || new Date(stored.created_at).getTime() > new Date(existing.created_at).getTime()) {
+      latestByConversation.set(stored.conversation_id, stored);
+    }
+  }
+
+  return latestByConversation;
+}
+
 export async function loadLatestMailroomRun(): Promise<{
   runId: string | null;
   conversations: MailroomReviewConversation[];
@@ -261,51 +301,17 @@ export async function loadLatestMailroomRun(): Promise<{
 
   /*
    * Load the durable Mailroom interpretation history for
-   * currently-live Inbox conversations.
+   * currently-live Inbox conversations, reduced to the newest
+   * stored interpretation per conversation.
    *
    * We are intentionally NOT restricting this to one run.
    * That is what lets a suggested reply survive while the
    * email remains in Inbox across later Mailroom batches.
    */
-  const storedConversations =
-    await loadStoredConversations(
+  const latestStoredByConversation =
+    await loadLatestStoredMailroomAnalyses(
       liveConversationIds
     );
-
-  /*
-   * Pick the newest stored interpretation for each Outlook
-   * conversation.
-   */
-  const latestStoredByConversation =
-    new Map<
-      string,
-      StoredConversation
-    >();
-
-  for (
-    const stored
-    of storedConversations
-  ) {
-    const existing =
-      latestStoredByConversation.get(
-        stored.conversation_id
-      );
-
-    if (
-      !existing ||
-      new Date(
-        stored.created_at
-      ).getTime() >
-        new Date(
-          existing.created_at
-        ).getTime()
-    ) {
-      latestStoredByConversation.set(
-        stored.conversation_id,
-        stored
-      );
-    }
-  }
 
   const merged:
     MailroomReviewConversation[] =
@@ -337,6 +343,13 @@ export async function loadLatestMailroomRun(): Promise<{
                   .hasUnprocessedInboxMessages
               )
             );
+
+          const hasCurrentAnalysis =
+            hasCurrentMailroomAnalysis({
+              mailroomConversationId: analysis?.id ?? null,
+              analysisMessageId: analysis?.latest_message_id ?? null,
+              currentMessageId: conversation.latestMessageId,
+            });
 
           if (
             !analysis ||
@@ -374,6 +387,11 @@ export async function loadLatestMailroomRun(): Promise<{
 
               hasStoredAnalysis:
                 false,
+
+              analysisMessageId:
+                analysis?.latest_message_id ?? null,
+
+              hasCurrentAnalysis,
             };
           }
 
@@ -432,6 +450,11 @@ export async function loadLatestMailroomRun(): Promise<{
 
             hasStoredAnalysis:
               true,
+
+            analysisMessageId:
+              analysis.latest_message_id,
+
+            hasCurrentAnalysis,
           };
         }
       );

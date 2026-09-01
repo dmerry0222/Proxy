@@ -41,6 +41,7 @@ function checkbox(properties: any, key: string): boolean {
 export type NotionMailroomPage = {
   pageId: string;
   conversationId: string | null;
+  outlookMessageId: string | null;
   subject: string | null;
   lastEditedTime: string | null;
   reviewed: ReviewedValues;
@@ -56,6 +57,10 @@ export async function readMailroomPage(pageId: string): Promise<NotionMailroomPa
     // record of which Outlook conversation it represents -- independent of
     // whatever view or filter the row happens to sit behind in Notion.
     conversationId: plainText(properties, "Conversation ID"),
+    // Identifies the specific actionable message, independent of
+    // conversationId -- used to recover the underlying email when the
+    // conversation's own mailroom_conversations row is missing/stale.
+    outlookMessageId: plainText(properties, "Outlook Message ID"),
     subject: titleText(properties, "Conversation"),
     lastEditedTime: page.last_edited_time ?? null,
     reviewed: {

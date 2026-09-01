@@ -981,3 +981,128 @@ export async function loadMailroomConversations(
 
   return conversations;
 }
+
+/**
+ * Loads and rebuilds a single conversation directly from `emails`, by
+ * Outlook conversation id, independent of the inbox/`processed` batch
+ * windowing that `loadMailroomConversations` applies. Used to reconstruct a
+ * Mailroom analysis for a conversation whose mailroom_conversations row is
+ * missing (e.g. purged) but whose underlying email still exists -- including
+ * a conversation that has since been archived out of the inbox entirely, so
+ * this deliberately does NOT require any inbox messages to exist.
+ */
+export async function loadMailroomConversationByConversationId(
+  conversationId: string
+): Promise<MailConversation | null> {
+  const { data: rows, error } = await supabaseServer
+    .from("emails")
+    .select(
+      `
+      outlook_message_id,
+      conversation_id,
+      direction,
+      folder,
+      from_name,
+      from_email,
+      subject,
+      body_preview,
+      body_html,
+      message_at,
+      received_at,
+      is_read,
+      is_in_inbox,
+      processed
+      ,internet_message_headers
+      ,is_calendar_related
+      ,calendar_message_kind
+      ,calendar_action
+      ,calendar_series_instance_id
+      ,to_recipients
+      ,cc_recipients
+      ,is_auto_reply
+      ,is_mailing_list
+      ,is_system_generated
+      ,list_id
+      `
+    )
+    .eq("conversation_id", conversationId);
+
+  if (error) {
+    throw new Error(`Could not load conversation ${conversationId} for Mailroom reconstruction: ${error.message}`);
+  }
+
+  if (!rows || rows.length === 0) {
+    return null;
+  }
+
+  const sortedMessages = (rows as EmailRow[])
+    .map(toMailMessage)
+    .sort((a, b) => getMessageTime(a) - getMessageTime(b));
+
+  const inboxMessages = sortedMessages.filter((message) => message.isInInbox === true);
+
+  const latestMessage = sortedMessages[sortedMessages.length - 1];
+
+  const latestIncoming =
+    [...sortedMessages].reverse().find((message) => message.direction.toLowerCase() === "incoming") ?? latestMessage;
+
+  const latestSubstantiveIncoming =
+    [...sortedMessages]
+      .reverse()
+      .find((message) => message.direction.toLowerCase() === "incoming" && !isSystemNoise(message)) ?? null;
+
+  const representativeMessage = latestSubstantiveIncoming ?? latestIncoming ?? latestMessage;
+
+  const incomingMessages = sortedMessages.filter((message) => message.direction.toLowerCase() === "incoming");
+  const isCalendarRelated = sortedMessages.some((message) => message.isCalendarRelated);
+  const isMailingList = incomingMessages.some((message) => message.isMailingList);
+  const listId = [...incomingMessages].reverse().find((message) => message.listId)?.listId ?? null;
+  const isAutoReply =
+    incomingMessages.length > 0 && incomingMessages.every((message) => message.isAutoReply || message.isCalendarRelated);
+
+  const bucket = temporaryBucket(representativeMessage);
+
+  const isMeetingInvitation = isActionableMeetingInvitation(
+    {
+      calendarMessageKind: latestMessage.calendarMessageKind as
+        | "meeting_response"
+        | "meeting_message"
+        | "cancellation"
+        | null,
+      calendarAction: latestMessage.calendarAction as "accepted" | "declined" | "tentative" | "cancelled" | null,
+      calendarSeriesInstanceId: latestMessage.calendarSeriesInstanceId,
+      isMeetingForward: latestMessage.isMeetingForward,
+      direction: latestMessage.direction,
+      subject: latestMessage.subject,
+      toRecipients: latestMessage.toRecipients,
+      ccRecipients: latestMessage.ccRecipients,
+      isInInbox: latestMessage.isInInbox,
+    },
+    MAILBOX_OWNER_EMAIL
+  );
+
+  const requestedAction = defaultRequestedAction(BUCKET_TO_CATEGORY[bucket], isMeetingInvitation);
+
+  return {
+    conversationId,
+    subject: normalizeSubject(representativeMessage.subject),
+    senderName: representativeMessage.fromName,
+    senderEmail: representativeMessage.fromEmail,
+    latestMessageId: latestMessage.outlookMessageId,
+    latestSubstantiveMessageId: latestSubstantiveIncoming?.outlookMessageId ?? null,
+    latestMessageAt: latestMessage.messageAt,
+    messages: sortedMessages,
+    inboxMessageIds: inboxMessages.map((message) => message.outlookMessageId),
+    hasUnprocessedInboxMessages: inboxMessages.some((message) => message.processed !== true),
+    systemType: getConversationSystemType(sortedMessages),
+    isCalendarRelated,
+    isAutoReply,
+    isMailingList,
+    listId,
+    bucket,
+    summary: representativeMessage.bodyPreview || "No preview available.",
+    requestedAction,
+    isMeetingInvitation,
+    feedback: "",
+  };
+}

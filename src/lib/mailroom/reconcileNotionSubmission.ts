@@ -1,12 +1,48 @@
 import "server-only";
 
-import { emitDiagnosticEvent } from "@/lib/diagnostics/emitEvent";
+import { emitDiagnosticEvent, recordIssue } from "@/lib/diagnostics/emitEvent";
 import { supabaseServer } from "@/lib/supabase/server";
 import { getSurfaceMapping, getSurfaceMappingByExternalId } from "@/lib/notion/mapping";
 import { readMailroomPage } from "@/lib/notion/readMailroomPage";
 import { releaseGuardedBaseline } from "@/lib/notion/guardedProperties";
 import { MAILROOM_GUARDED_PROPERTIES } from "@/lib/notion/syncMailroom";
+import { reconstructMailroomAnalysis } from "@/lib/mailroom/analyzeMailroom";
 import { planSubmissionReconciliation, type ProxyProposal } from "./submissionReconciliation";
+
+/**
+ * Looks for ANY surviving email evidence of the actionable conversation, so
+ * a missing mailroom_conversations row can be told apart from a truly gone
+ * conversation. Tries the mapped conversation id first (Proxy's own
+ * ledger), then falls back to the Outlook Message ID Notion has on record --
+ * the specific message the human is reviewing may still exist even if the
+ * conversation id Notion cached has drifted.
+ */
+async function findRecoverableEmail(
+  conversationId: string | null,
+  outlookMessageId: string | null
+): Promise<{ conversation_id: string | null } | null> {
+  if (conversationId) {
+    const { data } = await supabaseServer
+      .from("emails")
+      .select("conversation_id")
+      .eq("conversation_id", conversationId)
+      .limit(1)
+      .maybeSingle();
+    if (data) return data;
+  }
+
+  if (outlookMessageId) {
+    const { data } = await supabaseServer
+      .from("emails")
+      .select("conversation_id")
+      .eq("outlook_message_id", outlookMessageId)
+      .limit(1)
+      .maybeSingle();
+    if (data) return data;
+  }
+
+  return null;
+}
 
 export type NotionSubmissionResult = {
   ok: boolean;
@@ -88,13 +124,13 @@ export async function reconcileNotionSubmission(input: {
    * when no mapping row exists for this page.
    */
   const mappingByPage = await getSurfaceMappingByExternalId("mailroom_conversation", pageId);
-  const conversationId = mappingByPage?.proxyObjectId ?? page.conversationId;
+  let conversationId = mappingByPage?.proxyObjectId ?? page.conversationId;
 
   if (!conversationId) {
     return failure(`Notion page ${pageId} has no resolvable Mailroom conversation id.`, { pageId });
   }
 
-  const { data: conversation, error } = await supabaseServer
+  const { data: initialConversation, error } = await supabaseServer
     .from("mailroom_conversations")
     .select(
       "id, conversation_id, category, requested_action, recommended_action, suggested_reply, is_meeting_invitation, review_state"
@@ -107,9 +143,137 @@ export async function reconcileNotionSubmission(input: {
   if (error) {
     return failure(`Could not load Mailroom conversation: ${error.message}`, { pageId, conversationId });
   }
+
+  let conversation = initialConversation;
+
   if (!conversation) {
-    return failure(`No Mailroom analysis exists for conversation ${conversationId}.`, { pageId, conversationId });
+    /*
+     * No current mailroom_conversations analysis for this conversation --
+     * it may simply never have been (re)created, or the row was purged
+     * while the Notion page and/or the underlying email survived. Recover
+     * the actionable email (by the mapped conversation id, then by the
+     * Outlook Message ID Notion has on record) and reconstruct the
+     * analysis from it instead of failing outright. Never proceed with
+     * stale analysis: if nothing recoverable exists, say precisely why
+     * rather than returning a generic "no analysis" error.
+     */
+    const recovered = await findRecoverableEmail(conversationId, page.outlookMessageId);
+
+    if (!recovered) {
+      const detail = `Checked conversation id "${conversationId}"${
+        page.outlookMessageId ? ` and Outlook Message ID "${page.outlookMessageId}"` : ""
+      } against Supabase's emails table; no matching record was found, so the underlying email no longer exists there (or was never ingested).`;
+      await recordIssue({
+        traceId,
+        issueType: "mailroom_analysis_unrecoverable",
+        severity: "warning",
+        humanSummary: `No Mailroom analysis exists for conversation ${conversationId}, and it could not be recovered.`,
+        humanDetail: detail,
+        objectType: "mailroom_conversation",
+        objectId: conversationId,
+        sourceType: "notion",
+        sourceId: pageId,
+        retryable: false,
+        technicalDetail: detail,
+      });
+      return failure(
+        `No Mailroom analysis exists for conversation ${conversationId}, and it could not be recovered: ${detail}`,
+        { pageId, conversationId }
+      );
+    }
+
+    // The mapped conversation id may itself be stale; prefer whatever the
+    // recovered email row actually reports as its conversation id.
+    if (recovered.conversation_id && recovered.conversation_id !== conversationId) {
+      await emitDiagnosticEvent({
+        traceId,
+        module: "mailroom",
+        stage: "notion_submission",
+        eventType: "conversation_mapping_stale",
+        status: "success",
+        severity: "warning",
+        objectType: "mailroom_conversation",
+        objectId: conversationId,
+        humanSummary: `The Notion page's mapped conversation id ("${conversationId}") had no matching email; recovered via Outlook Message ID and it actually belongs to conversation "${recovered.conversation_id}". Using the corrected id.`,
+        metadata: { mappedConversationId: conversationId, correctedConversationId: recovered.conversation_id, pageId },
+      });
+    }
+    conversationId = recovered.conversation_id ?? conversationId;
+
+    let reconstructed: Awaited<ReturnType<typeof reconstructMailroomAnalysis>>;
+    try {
+      reconstructed = await reconstructMailroomAnalysis(conversationId);
+    } catch (reconstructError) {
+      const message = reconstructError instanceof Error ? reconstructError.message : "Unknown error";
+      await recordIssue({
+        traceId,
+        issueType: "mailroom_analysis_reconstruction_failed",
+        severity: "error",
+        humanSummary: "Mailroom analysis was missing and could not be reconstructed from the underlying email.",
+        objectType: "mailroom_conversation",
+        objectId: conversationId,
+        sourceType: "notion",
+        sourceId: pageId,
+        retryable: true,
+        technicalDetail: message,
+      });
+      return failure(
+        `The email for conversation ${conversationId} still exists in Supabase, but Mailroom analysis could not be reconstructed: ${message}`,
+        { pageId, conversationId }
+      );
+    }
+
+    if (!reconstructed) {
+      const detail = `The email for conversation ${conversationId} was found in Supabase, but no messages could be loaded from it to reconstruct an analysis.`;
+      await recordIssue({
+        traceId,
+        issueType: "mailroom_analysis_unrecoverable",
+        severity: "warning",
+        humanSummary: "Mailroom analysis could not be reconstructed.",
+        humanDetail: detail,
+        objectType: "mailroom_conversation",
+        objectId: conversationId,
+        sourceType: "notion",
+        sourceId: pageId,
+        retryable: false,
+      });
+      return failure(detail, { pageId, conversationId });
+    }
+
+    conversation = reconstructed.conversation;
+
+    await emitDiagnosticEvent({
+      traceId,
+      module: "mailroom",
+      stage: "notion_submission",
+      eventType: "analysis_reconstructed",
+      status: "success",
+      objectType: "mailroom_conversation",
+      objectId: conversationId,
+      humanSummary: `Reconstructed missing Mailroom analysis for conversation ${conversationId} from its underlying email before reconciling Dave's Notion review.`,
+      metadata: { mailroomConversationId: reconstructed.mailroomConversationId },
+    });
   }
+
+  await emitDiagnosticEvent({
+    traceId,
+    module: "mailroom",
+    stage: "notion_submission",
+    eventType: "proposal_loaded",
+    status: "success",
+    objectType: "mailroom_conversation",
+    objectId: conversationId,
+    humanSummary: `Loaded Mailroom analysis for "${page.subject ?? "(no subject)"}" (category: ${
+      conversation.category
+    }, proposed action: ${conversation.recommended_action ?? conversation.requested_action ?? "none"}).`,
+    metadata: {
+      mailroomConversationId: conversation.id,
+      category: conversation.category,
+      recommendedAction: conversation.recommended_action,
+      requestedAction: conversation.requested_action,
+      subject: page.subject,
+    },
+  });
 
   const proposal: ProxyProposal = {
     mailroomConversationId: conversation.id as string,

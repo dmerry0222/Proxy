@@ -120,6 +120,17 @@ export async function syncOne(params: {
    * untouched instead of being overwritten. See guardedProperties.ts.
    */
   guardedProperties?: string[];
+  /**
+   * Forces `archived: false` on every update. Opt-in and off by default: a
+   * blanket un-archive on every push would fight a human who intentionally
+   * archived a page in Notion for their own housekeeping (e.g. an Execute
+   * item). Mailroom passes this because ITS archiving is something Proxy
+   * itself does (see remediate-mailroom-projection) specifically so the
+   * same page reappears automatically once real analysis makes it
+   * reviewable again -- no human archiving convention exists for Mailroom
+   * rows to protect against.
+   */
+  unarchiveOnUpdate?: boolean;
 }): Promise<ObjectAction> {
   const canonicalHash = computeCanonicalHash(params.canonicalFields);
   const existing = await getSurfaceMapping(params.objectType, params.objectId);
@@ -184,6 +195,7 @@ export async function syncOne(params: {
       await notionClient.pages.update({
         page_id: mapping.externalObjectId,
         properties: payload as any,
+        ...(params.unarchiveOnUpdate ? { archived: false } : {}),
       });
       await markPushed(mapping.id, { externalObjectId: mapping.externalObjectId, canonicalHash, metadata });
       return "updated";
