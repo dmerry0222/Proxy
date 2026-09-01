@@ -173,6 +173,17 @@ export async function reconcileNotionSubmission(input: {
       });
     }
     correctionsRecorded = plan.corrections.length;
+    await emitDiagnosticEvent({
+      traceId,
+      module: "mailroom",
+      stage: "notion_submission",
+      eventType: "correction_evidence_recorded",
+      status: "success",
+      objectType: "mailroom_conversation",
+      objectId: conversationId,
+      humanSummary: `Recorded ${correctionsRecorded} correction record(s) from Dave's review.`,
+      metadata: { changedFields: plan.changedFields, correctionsRecorded },
+    });
   }
 
   /*

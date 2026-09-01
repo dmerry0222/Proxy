@@ -144,6 +144,15 @@ export async function dispatchMailroomCommand(commandId: string): Promise<void> 
 
   if (!url) {
     console.log(`Mailroom command ${commandId} queued; POWER_AUTOMATE_MAILROOM_URL not configured yet, leaving queued.`);
+    await emitDiagnosticEvent({
+      traceId: command.trace_id as string | null,
+      module: "mailroom_action",
+      stage: "dispatched",
+      eventType: "command_left_queued",
+      status: "success",
+      objectType: "mailroom_conversation",
+      humanSummary: "Left queued: POWER_AUTOMATE_MAILROOM_URL is not configured yet.",
+    });
     return;
   }
 
