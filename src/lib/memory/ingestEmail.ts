@@ -4,9 +4,10 @@ import Anthropic from "@anthropic-ai/sdk";
 
 import { supabaseServer } from "@/lib/supabase/server";
 import { resolveMemoryEntityByEmail } from "@/lib/memory/resolveEntity";
+import { classifyUnresolvedSenderDiagnostic } from "@/lib/memory/externalSenderAddressRules";
 import { reconcileMemoryClaim } from "@/lib/memory/claimReconciliation";
 import { startTrace, completeTrace, emitDiagnosticEvent, recordIssue } from "@/lib/diagnostics/emitEvent";
-import { htmlToPlainText } from "@/lib/memory/htmlToPlainText";
+import { buildCleanedEmailBody } from "@/lib/email/normalizeEmailBody";
 import { extractEmailOperationalEvidence } from "@/lib/reconciliation/emailEvidence";
 import { reconcileEnvelope } from "@/lib/reconciliation/reconcileEnvelope";
 import { completeReconciliationRun, emptyCounters, recordReconciliationDecision, startReconciliationRun } from "@/lib/reconciliation/runs";
@@ -115,44 +116,6 @@ function redactSensitiveContent(
     );
 }
 
-
-export function stripQuotedReplyHistory(
-  text: string
-) {
-  const markers = [
-    /^from:\s.+$/im,
-    /^on .+ wrote:$/im,
-    /^-{2,}\s*original message\s*-{2,}$/im,
-    /^_{5,}$/m,
-  ];
-
-  let cutoff =
-    text.length;
-
-  for (
-    const marker
-    of markers
-  ) {
-    const match =
-      marker.exec(text);
-
-    if (
-      match &&
-      match.index <
-        cutoff
-    ) {
-      cutoff =
-        match.index;
-    }
-  }
-
-  return text
-    .slice(
-      0,
-      cutoff
-    )
-    .trim();
-}
 
 function isRoutineCalendarResponse(
   subject: string | null
@@ -557,14 +520,22 @@ async function ingestEmailToMemoryTraced(
     );
 
   if (!resolution) {
+    const normalizedFrom = (loadedEmail.from_email ?? "").trim().toLowerCase();
+    const diagnostic = classifyUnresolvedSenderDiagnostic(normalizedFrom);
+
     await emitDiagnosticEvent({
       traceId,
       module: "memory",
       stage: "identified",
       eventType: "sender_resolution",
-      status: "warning",
-      humanSummary: "Proxy couldn't match the sender to a known person, so this email was skipped.",
-      metadata: { from: loadedEmail.from_email },
+      status: diagnostic.status,
+      severity: diagnostic.severity,
+      humanSummary: diagnostic.humanSummary,
+      metadata: {
+        from: loadedEmail.from_email,
+        is_suffolk_sender: diagnostic.isSuffolkSender,
+        likely_automated: diagnostic.likelyAutomated,
+      },
     });
     await completeTrace(traceId, { status: "completed", summary: "Skipped — sender not recognized." });
 
@@ -585,7 +556,13 @@ async function ingestEmailToMemoryTraced(
     status: "success",
     objectType: "memory_entity",
     objectId: resolution.entityId,
-    humanSummary: `Recognized sender as ${resolution.canonicalName}.`,
+    humanSummary:
+      resolution.seededFrom === "org_chart"
+        ? `Recognized sender as ${resolution.canonicalName} (auto-seeded from Suffolk org chart).`
+        : resolution.seededFrom === "external_correspondence"
+          ? `Recognized sender as ${resolution.canonicalName} (auto-seeded from external correspondence).`
+          : `Recognized sender as ${resolution.canonicalName}.`,
+    metadata: { resolution_source: resolution.seededFrom ?? "existing_identity" },
   });
 
   /*
@@ -896,26 +873,44 @@ async function ingestEmailToMemoryTraced(
 
   /*
    * 5. Prepare current-message content.
+   *
+   * buildCleanedEmailBody is the SAME shared cleaner Mailroom's summaries
+   * use (src/lib/email/normalizeEmailBody.ts) -- it does everything the
+   * old local htmlToPlainText + stripQuotedReplyHistory pipeline did, plus
+   * stripping the Suffolk external-sender security banner and a
+   * conservative signature cut, so a short external email's extraction
+   * isn't performed against boilerplate.
    */
-  const rawEmailContent =
-    loadedEmail.body_html
-      ? htmlToPlainText(
-          loadedEmail.body_html
-        )
-      : (
-          loadedEmail.body_preview ??
-          ""
-        ).trim();
-
-  const currentMessageContent =
-    stripQuotedReplyHistory(
-      rawEmailContent
-    );
+  const cleaned = buildCleanedEmailBody({
+    bodyHtml: loadedEmail.body_html,
+    bodyPreview: loadedEmail.body_preview,
+  });
 
   const emailContent =
     redactSensitiveContent(
-      currentMessageContent
+      cleaned.text
     );
+
+  await emitDiagnosticEvent({
+    traceId,
+    module: "memory",
+    stage: "received",
+    eventType: "body_preprocessed",
+    status: "success",
+    objectType: "memory_source",
+    objectId: establishedSourceId,
+    humanSummary: cleaned.externalBannerRemoved || cleaned.quotedHistoryRemoved || cleaned.signatureRemoved
+      ? "Cleaned email body before Memory extraction."
+      : "Email body required no cleaning.",
+    // Character counts only -- never the body content itself.
+    metadata: {
+      external_banner_removed: cleaned.externalBannerRemoved,
+      quoted_history_removed: cleaned.quotedHistoryRemoved,
+      signature_removed: cleaned.signatureRemoved,
+      original_character_count: cleaned.originalCharacterCount,
+      cleaned_character_count: cleaned.cleanedCharacterCount,
+    },
+  });
 
   /*
    * 6. Claude extraction.

@@ -22,7 +22,13 @@
     "test:external-artifact-request": "node --experimental-strip-types --test test-external-artifact-request.mjs",
     "test:submission-reconciliation": "node --experimental-strip-types --test test-submission-reconciliation.mjs",
     "test:execution-target": "node --experimental-strip-types --test test-execution-target.mjs",
-    "test:analysis-readiness": "node --experimental-strip-types --test test-analysis-readiness.mjs"
+    "test:analysis-readiness": "node --experimental-strip-types --test test-analysis-readiness.mjs",
+    "test:external-sender-eligibility": "node --experimental-strip-types --test test-external-sender-eligibility.mjs",
+    "test:email-body-normalization": "node --experimental-strip-types --test test-email-body-normalization.mjs",
+    "test:claim-review-policy": "node --experimental-strip-types --test test-claim-review-policy.mjs",
+    "test:pending-context-review-policy": "node --experimental-strip-types --test test-pending-context-review-policy.mjs",
+    "test:claim-duplication-rules": "node --experimental-strip-types --test test-claim-duplication-rules.mjs",
+    "test:claim-consequence-policy": "node --experimental-strip-types --test test-claim-consequence-policy.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.120.0",

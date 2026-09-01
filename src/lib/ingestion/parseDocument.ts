@@ -4,8 +4,46 @@ import type {
   ParsedSection,
 } from "@/lib/ingestion/types";
 
-import mammoth from "mammoth";
-import { PDFParse } from "pdf-parse";
+/*
+ * `pdf-parse` and `mammoth` are loaded LAZILY, inside the branch that
+ * actually needs them -- never at module scope.
+ *
+ * This is not a micro-optimization. `pdf-parse` re-exports
+ * `pdfjs-dist/legacy/build/pdf.mjs`, which at MODULE SCOPE evaluates
+ * `const SCALE_MATRIX = new DOMMatrix();`. In Node, `DOMMatrix` is not a
+ * global; pdfjs tries to polyfill it by `require`ing the native
+ * `@napi-rs/canvas` addon, and when that require fails it merely warns --
+ * then throws `ReferenceError: DOMMatrix is not defined` a few lines
+ * later. Bundled into a Vercel serverless function, the native addon is
+ * not reliably resolvable, so the import threw during module evaluation
+ * and took the whole route down before its request handler ever ran
+ * (a ~11ms failure with no outbound calls, and an empty 500 that the
+ * route's own try/catch could not intercept).
+ *
+ * Static imports made every Markdown/text/JSON artifact pay that risk for
+ * a parser it never calls. Deferring the import means text ingestion never
+ * touches pdfjs at all, and a genuine PDF failure surfaces as a catchable
+ * rejection with a useful stage instead of a dead function.
+ *
+ * See also `serverExternalPackages` in next.config.ts, which keeps
+ * pdf-parse/pdfjs-dist/@napi-rs/canvas out of the bundle so the native
+ * addon resolves normally at runtime when a PDF really does arrive.
+ */
+
+/** Carries the pipeline stage that failed, so callers can report where it broke. */
+export class DocumentParseError extends Error {
+  readonly stage: string;
+
+  constructor(stage: string, message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "DocumentParseError";
+    this.stage = stage;
+  }
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 const TEXT_MIME_TYPES = new Set([
   "text/plain",
@@ -119,23 +157,66 @@ export async function parseDocument(bytes: Uint8Array, mimeType: string): Promis
   let parserName: string;
 
   if (mimeType === "application/pdf") {
+    /*
+     * Deliberately two separate try/catches: a failure to LOAD the parser
+     * (missing native canvas addon, DOMMatrix) is an environment problem,
+     * while a failure to READ the document is a bad-input problem. They
+     * want different stages because they need different responses --
+     * redeploy vs. reject the file.
+     */
+    let PDFParse: typeof import("pdf-parse").PDFParse;
+    try {
+      ({ PDFParse } = await import("pdf-parse"));
+    } catch (error) {
+      throw new DocumentParseError(
+        "load_pdf_parser",
+        `PDF parsing is unavailable in this runtime: ${describe(error)}`,
+        { cause: error },
+      );
+    }
+
     const parser = new PDFParse({ data: bytes });
     try {
       const result = await parser.getText();
       sourceText = result.text;
       parserName = "pdf_parse_v1";
+    } catch (error) {
+      throw new DocumentParseError("parse_pdf", `Could not read the PDF: ${describe(error)}`, { cause: error });
     } finally {
       await parser.destroy();
     }
   } else if (mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
-    const result = await mammoth.extractRawText({ buffer: Buffer.from(bytes) });
-    sourceText = result.value;
-    parserName = "mammoth_raw_text_v1";
+    let mammoth: typeof import("mammoth");
+    try {
+      mammoth = (await import("mammoth")).default;
+    } catch (error) {
+      throw new DocumentParseError(
+        "load_docx_parser",
+        `DOCX parsing is unavailable in this runtime: ${describe(error)}`,
+        { cause: error },
+      );
+    }
+
+    try {
+      const result = await mammoth.extractRawText({ buffer: Buffer.from(bytes) });
+      sourceText = result.value;
+      parserName = "mammoth_raw_text_v1";
+    } catch (error) {
+      throw new DocumentParseError("parse_docx", `Could not read the Word document: ${describe(error)}`, { cause: error });
+    }
   } else if (TEXT_MIME_TYPES.has(mimeType)) {
+    // No parser library is loaded on this path at all -- this is the
+    // Markdown/text/JSON route that was previously crashing on pdfjs.
     const decoded = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-    sourceText = mimeType === "application/json"
-      ? JSON.stringify(JSON.parse(decoded), null, 2)
-      : decoded;
+    if (mimeType === "application/json") {
+      try {
+        sourceText = JSON.stringify(JSON.parse(decoded), null, 2);
+      } catch (error) {
+        throw new DocumentParseError("parse_json", `Attachment is not valid JSON: ${describe(error)}`, { cause: error });
+      }
+    } else {
+      sourceText = decoded;
+    }
     parserName = mimeType === "text/vtt" ? "vtt_text_v1" : "structured_text_v1";
   } else {
     return { supported: false, text: "", frontmatter: {}, sections: [], parserName: "stored_only", parserVersion: 1 };

@@ -1,8 +1,9 @@
 import "server-only";
 
 import { supabaseServer } from "@/lib/supabase/server";
-import { ingestEmailToMemory, reconcileEmailEvidence, stripQuotedReplyHistory } from "@/lib/memory/ingestEmail";
+import { ingestEmailToMemory, reconcileEmailEvidence } from "@/lib/memory/ingestEmail";
 import { htmlToPlainText } from "@/lib/memory/htmlToPlainText";
+import { stripQuotedReplyHistory } from "@/lib/email/normalizeEmailBody";
 import { resolveMemoryEntityByEmail } from "@/lib/memory/resolveEntity";
 import { processTeamsConversationDelta } from "@/lib/memory/processTeamsConversationDelta";
 import { processCalendarSyncRun } from "@/lib/memory/processCalendarSyncRun";

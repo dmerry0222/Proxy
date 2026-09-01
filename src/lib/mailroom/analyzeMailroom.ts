@@ -18,6 +18,7 @@ import {
 } from "@/lib/memory/resolveEntity";
 
 import { supabaseServer } from "@/lib/supabase/server";
+import { buildCleanedEmailBody } from "@/lib/email/normalizeEmailBody";
 
 import type {
   MailConversation,
@@ -345,6 +346,11 @@ function buildConversationText(
             message.subject
           );
 
+        const cleanedBody = buildCleanedEmailBody({
+          bodyHtml: message.bodyHtml,
+          bodyPreview: message.bodyPreview,
+        }).text;
+
         return [
           `MESSAGE ${index + 1}`,
           `Direction: ${message.direction}`,
@@ -355,8 +361,7 @@ function buildConversationText(
           noiseLabel,
           ...normalizedMetadata,
           "",
-          message.bodyPreview ??
-            "(No message text available)",
+          cleanedBody || "(No message text available)",
         ].join("\n");
       }
     )
@@ -583,6 +588,32 @@ Low Value
 Advertising, generic promotions, low-value newsletters, irrelevant
 notifications, spam-like mail, or information Dave is unlikely to need.
 
+SUMMARY RULES:
+
+- The summary must be ABSTRACTIVE, not a truncation or paraphrase of the
+  opening lines. Read the whole message and answer: What is this actually
+  about? Is the sender asking for something? Is there an update, decision,
+  deadline, or informational point Dave needs?
+- Never let institutional boilerplate (security banners, "this email
+  originated from outside the organization" warnings, confidentiality
+  notices) become the summary. If a message is ONLY boilerplate with no
+  substantive content, say so plainly (e.g. "No substantive content --
+  automated security notice only") rather than quoting the notice.
+- Never let a greeting or pleasantry ("Hi Dave, hope you had a great
+  weekend") stand in for the actual point of the email -- identify what
+  the sender wants or is telling Dave, even if it appears several
+  sentences in.
+- GOOD: "Jordan is asking whether Suffolk can participate in the employer
+  panel on October 4."
+- GOOD: "Sarah shared the revised internship approval workflow and wants
+  feedback before Friday."
+- BAD: "CAUTION: This email originated from outside of the University..."
+- BAD: "Hi Dave, hope you had a great weekend..."
+- For a very short, already-substantive message (e.g. a one-line yes/no
+  answer), a near-verbatim summary is fine -- the rule above is about
+  never substituting boilerplate/greetings for substance, not about
+  padding short messages artificially.
+
 RULES:
 
 - Analyze the whole thread, not just the latest message.
@@ -756,12 +787,27 @@ ${conversationText}
   }
 
   if (
-    typeof analysis.summary !==
-    "string"
+    typeof analysis.summary !== "string" ||
+    !analysis.summary.trim()
   ) {
-    throw new Error(
-      "Claude returned an invalid summary"
-    );
+    /*
+     * Last-resort emergency fallback only -- not the normal path. A
+     * malformed/missing summary here previously threw and failed the
+     * ENTIRE batch's insert for this conversation (runMailroomAnalysis
+     * aborts the whole run on any single conversation's error). Falling
+     * back to a truncated CLEANED excerpt (never the raw banner-laden
+     * bodyPreview) keeps one bad model response from taking down a whole
+     * Mailroom run, while still never surfacing boilerplate as if it were
+     * a real summary.
+     */
+    console.warn(`Mailroom: Claude returned no usable summary for "${conversation.subject}"; using a fallback excerpt.`);
+    const fallbackMessage = conversation.messages[conversation.messages.length - 1] ?? null;
+    const cleanedFallback = fallbackMessage
+      ? buildCleanedEmailBody({ bodyHtml: fallbackMessage.bodyHtml, bodyPreview: fallbackMessage.bodyPreview }).text
+      : "";
+    analysis.summary = cleanedFallback
+      ? cleanedFallback.slice(0, 200) + (cleanedFallback.length > 200 ? "…" : "")
+      : conversation.summary || `Email from ${conversation.senderEmail ?? "unknown sender"} — no readable content.`;
   }
 
   return {

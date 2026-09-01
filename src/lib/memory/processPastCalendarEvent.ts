@@ -15,6 +15,8 @@ import { reconcileCalendarEvent, type CalendarReconcileEvent } from "@/lib/recon
 import { completeReconciliationRun, emptyCounters, startReconciliationRun } from "@/lib/reconciliation/runs";
 import type { ActorRef, ReconciliationTrigger } from "@/lib/reconciliation/types";
 import { htmlToPlainText } from "@/lib/memory/htmlToPlainText";
+import { findCollapsibleExistingClaim } from "@/lib/memory/claimReconciliation";
+import { assessClaimReviewTier } from "@/lib/memory/claimReviewPolicy";
 
 const CALENDAR_PROCESSOR_VERSION = 1;
 const DAVE_EMAIL = "dmerry@suffolk.edu";
@@ -337,6 +339,48 @@ Return JSON only:
     const evidenceStrength = EVIDENCE_STRENGTHS.has(claim.evidenceStrength ?? "") ? claim.evidenceStrength! : "weak";
     const statement = claim.statement!.trim();
 
+    /*
+     * Deterministic duplicate pre-check. This path used to insert a claim
+     * and a review item unconditionally, so a fact Memory already held
+     * from email or Teams arrived in Dave's queue a second time. On a
+     * collapse-safe match we attach this event's evidence to the existing
+     * claim and create nothing new -- the claim gets stronger, the queue
+     * does not grow.
+     */
+    const collapsible = await findCollapsibleExistingClaim(participant.entityId, statement);
+
+    if (collapsible) {
+      const { error: attachError } = await supabaseServer
+        .from("memory_claim_evidence")
+        .upsert(
+          evidenceIds.map((evidenceId) => ({
+            claim_id: collapsible.claim.id,
+            evidence_id: evidenceId,
+            relationship: "supports",
+          })),
+          { onConflict: "claim_id,evidence_id", ignoreDuplicates: true },
+        );
+
+      if (attachError) {
+        throw new Error(`Could not attach Calendar evidence to existing claim: ${attachError.message}`);
+      }
+
+      continue;
+    }
+
+    /*
+     * Same tiered review policy the email path uses. Previously this path
+     * bypassed it entirely and created a review item for every claim
+     * regardless of stakes.
+     */
+    const reviewTier = assessClaimReviewTier({
+      claimType,
+      statement,
+      evidenceStrength: evidenceStrength as "weak" | "moderate" | "strong" | "confirmed",
+      relationship: "new",
+      existingClaim: null,
+    });
+
     const { data: newClaim, error: claimError } = await supabaseServer
       .from("memory_claims")
       .insert({
@@ -353,6 +397,9 @@ Return JSON only:
           source_type: "calendar_reconciliation",
           event_id: event.event_id,
           ingestion_version: CALENDAR_PROCESSOR_VERSION,
+          risk_tier: reviewTier.tier,
+          risk_tier_reason: reviewTier.reason,
+          auto_saved: reviewTier.tier === "auto_save",
         },
       })
       .select("id")
@@ -378,25 +425,28 @@ Return JSON only:
       throw new Error(`Could not connect Calendar claim to evidence: ${claimEvidenceError.message}`);
     }
 
-    const { error: reviewError } = await supabaseServer.from("memory_review_items").insert({
-      review_type: "confirm_claim",
-      status: "pending",
-      title: "Review extracted Memory",
-      prompt: statement,
-      claim_id: newClaim.id,
-      entity_id: participant.entityId,
-      priority: 40,
-      payload: {
-        options: ["Confirm", "Outdated", "Keep as evidence", "Not sure", "Dismiss"],
-        generated_by: "calendar_reconciliation",
-        ingestion_version: CALENDAR_PROCESSOR_VERSION,
-        source_type: "calendar_reconciliation",
-        event_id: event.event_id,
-      },
-    });
+    if (reviewTier.tier !== "auto_save") {
+      const { error: reviewError } = await supabaseServer.from("memory_review_items").insert({
+        review_type: "confirm_claim",
+        status: "pending",
+        title: "Review extracted Memory",
+        prompt: statement,
+        claim_id: newClaim.id,
+        entity_id: participant.entityId,
+        priority: 40,
+        payload: {
+          options: ["Confirm", "Outdated", "Keep as evidence", "Not sure", "Dismiss"],
+          generated_by: "calendar_reconciliation",
+          ingestion_version: CALENDAR_PROCESSOR_VERSION,
+          source_type: "calendar_reconciliation",
+          event_id: event.event_id,
+          risk_tier_reason: reviewTier.reason,
+        },
+      });
 
-    if (reviewError) {
-      throw new Error(`Could not create Calendar claim review item: ${reviewError.message}`);
+      if (reviewError) {
+        throw new Error(`Could not create Calendar claim review item: ${reviewError.message}`);
+      }
     }
 
     claimsCreated += 1;

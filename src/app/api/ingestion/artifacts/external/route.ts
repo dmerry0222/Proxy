@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { IngestionAuthError, requireIngestionSecret } from "@/lib/auth/ingestionAuth";
 import { completeTrace, emitDiagnosticEvent, recordIssue, startTrace } from "@/lib/diagnostics/emitEvent";
 import { ingestArtifact } from "@/lib/ingestion/ingestArtifact";
+import { DocumentParseError } from "@/lib/ingestion/parseDocument";
 import {
   decodeBase64Content,
   externalArtifactIdentity,
@@ -292,6 +293,14 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown ingestion error";
+    /*
+     * Surface WHERE it broke, not just that it broke. parseDocument throws
+     * DocumentParseError carrying the pipeline stage; anything else is
+     * reported against the route's own stage so the response always names
+     * one. Power Automate logs the body, so this is often the only forensic
+     * trail available.
+     */
+    const stage = error instanceof DocumentParseError ? error.stage : "external_intake";
 
     /*
      * Two Power Automate retries can arrive concurrently and both pass the
@@ -329,7 +338,7 @@ export async function POST(request: Request) {
       }
     }
 
-    console.error("External artifact ingestion failed:", error);
+    console.error(`External artifact ingestion failed at stage "${stage}":`, error);
     await emitDiagnosticEvent({
       traceId,
       module: "ingestion",
@@ -339,21 +348,25 @@ export async function POST(request: Request) {
       severity: "error",
       objectType: emailObjectId ? "email" : null,
       objectId: emailObjectId,
-      humanSummary: `Failed to ingest "${input.filename}"`,
+      humanSummary: `Failed to ingest "${input.filename}" (${stage})`,
       technicalDetail: message,
+      metadata: { failed_stage: stage, mime_type: input.mimeType, filename: input.filename },
     });
     await recordIssue({
       traceId,
       issueType: "external_ingestion_failed",
       severity: "error",
-      humanSummary: `External artifact ingestion failed for "${input.filename}"`,
+      humanSummary: `External artifact ingestion failed for "${input.filename}" (${stage})`,
       sourceType: "external_ingestion",
       sourceId: externalId,
       retryable: true,
       technicalDetail: message,
     });
-    await completeTrace(traceId, { status: "failed", summary: message });
+    await completeTrace(traceId, { status: "failed", summary: `${stage}: ${message}` });
 
-    return NextResponse.json({ success: false, error: message, traceId }, { status: 500 });
+    return NextResponse.json(
+      { success: false, stage, error: message, filename: input.filename, mimeType: input.mimeType, traceId },
+      { status: 500 },
+    );
   }
 }

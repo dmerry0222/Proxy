@@ -6,6 +6,8 @@ import Anthropic from "@anthropic-ai/sdk";
 
 import { resolveMemoryEntityByEmail } from "@/lib/memory/resolveEntity";
 import { supabaseServer } from "@/lib/supabase/server";
+import { findCollapsibleExistingClaim } from "@/lib/memory/claimReconciliation";
+import { assessClaimReviewTier } from "@/lib/memory/claimReviewPolicy";
 import { extractTeamsOperationalEvidence, type TeamsBatchMessage } from "@/lib/reconciliation/teamsEvidence";
 import { reconcileEnvelope } from "@/lib/reconciliation/reconcileEnvelope";
 import { findOpenItemsContext } from "@/lib/reconciliation/matchCandidates";
@@ -588,6 +590,42 @@ Return JSON only:
       continue;
     }
 
+    /*
+     * Deterministic duplicate pre-check -- see the matching block in
+     * processPastCalendarEvent.ts. A Teams discussion frequently restates
+     * a decision Memory already captured from the calendar event or the
+     * follow-up email; without this the same proposition reached Dave's
+     * review queue once per source.
+     */
+    const collapsible = await findCollapsibleExistingClaim(participant.entityId, statement);
+
+    if (collapsible) {
+      const { error: attachError } = await supabaseServer
+        .from("memory_claim_evidence")
+        .upsert(
+          evidenceIds.map((evidenceId) => ({
+            claim_id: collapsible.claim.id,
+            evidence_id: evidenceId,
+            relationship: "supports",
+          })),
+          { onConflict: "claim_id,evidence_id", ignoreDuplicates: true },
+        );
+
+      if (attachError) {
+        throw new Error(`Could not attach Teams evidence to existing claim: ${attachError.message}`);
+      }
+
+      continue;
+    }
+
+    const reviewTier = assessClaimReviewTier({
+      claimType,
+      statement,
+      evidenceStrength: evidenceStrength as "weak" | "moderate" | "strong" | "confirmed",
+      relationship: "new",
+      existingClaim: null,
+    });
+
     const { data: newClaim, error: claimError } = await supabaseServer
       .from("memory_claims")
       .insert({
@@ -604,6 +642,9 @@ Return JSON only:
           source_type: "teams_conversation",
           chat_id: chatId,
           ingestion_version: TEAMS_BATCH_PROCESSOR_VERSION,
+          risk_tier: reviewTier.tier,
+          risk_tier_reason: reviewTier.reason,
+          auto_saved: reviewTier.tier === "auto_save",
         },
       })
       .select("id")
@@ -629,25 +670,28 @@ Return JSON only:
       throw new Error(`Could not connect Teams claim to evidence: ${claimEvidenceError.message}`);
     }
 
-    const { error: reviewError } = await supabaseServer.from("memory_review_items").insert({
-      review_type: "confirm_claim",
-      status: "pending",
-      title: "Review extracted Memory",
-      prompt: statement,
-      claim_id: newClaim.id,
-      entity_id: participant.entityId,
-      priority: 40,
-      payload: {
-        options: ["Confirm", "Outdated", "Keep as evidence", "Not sure", "Dismiss"],
-        generated_by: "teams_conversation_processing",
-        ingestion_version: TEAMS_BATCH_PROCESSOR_VERSION,
-        source_type: "teams_conversation",
-        chat_id: chatId,
-      },
-    });
+    if (reviewTier.tier !== "auto_save") {
+      const { error: reviewError } = await supabaseServer.from("memory_review_items").insert({
+        review_type: "confirm_claim",
+        status: "pending",
+        title: "Review extracted Memory",
+        prompt: statement,
+        claim_id: newClaim.id,
+        entity_id: participant.entityId,
+        priority: 40,
+        payload: {
+          options: ["Confirm", "Outdated", "Keep as evidence", "Not sure", "Dismiss"],
+          generated_by: "teams_conversation_processing",
+          ingestion_version: TEAMS_BATCH_PROCESSOR_VERSION,
+          source_type: "teams_conversation",
+          chat_id: chatId,
+          risk_tier_reason: reviewTier.reason,
+        },
+      });
 
-    if (reviewError) {
-      throw new Error(`Could not create Teams Memory claim review item: ${reviewError.message}`);
+      if (reviewError) {
+        throw new Error(`Could not create Teams Memory claim review item: ${reviewError.message}`);
+      }
     }
   }
 

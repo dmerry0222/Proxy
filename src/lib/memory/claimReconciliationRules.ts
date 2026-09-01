@@ -1,8 +1,11 @@
+import { valuesConflict } from "./claimDuplicationRules.ts";
+
 export type ClaimRelationship = "new" | "supports_existing" | "refines_existing" |
   "contradicts_existing" | "duplicates_existing" | "supersedes_existing";
 
 export type ExistingClaimForReconciliation = {
   id: string; statement: string; status: string; confirmed_by_user: boolean; evidence_strength: string | null;
+  claim_type: string; is_governing_context: boolean;
 };
 
 const STOP_WORDS = new Set(["a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "he",
@@ -32,6 +35,17 @@ export function classifyClaimRelationshipDeterministically(candidate: string,
   const similarity = propositionSimilarity(candidate, existing.statement);
   if (similarity >= 0.45 && CHANGE_CUES.test(candidate)) return "supersedes_existing";
   if (similarity >= 0.55 && NEGATION.test(candidate) !== NEGATION.test(existing.statement)) return "contradicts_existing";
+  /*
+   * Value-conflict guard. `propositionSimilarity` cannot see monetary
+   * amounts at all (see claimDuplicationRules.ts), so "budget is $3,000"
+   * and "budget is $4,000" score a perfect 1.0 and would otherwise fall
+   * straight into the `>= 0.82 -> duplicates_existing` branch below,
+   * collapsing away the only part of the statement that mattered.
+   * Near-identical wording asserting a DIFFERENT amount is a conflict for
+   * Dave to referee, never a silent duplicate. Placed ahead of the
+   * confirmed-user branch so a confirmed claim can't absorb it either.
+   */
+  if (similarity >= 0.55 && valuesConflict(candidate, existing.statement)) return "contradicts_existing";
   if (existing.confirmed_by_user && ["durable", "candidate"].includes(existing.status) && similarity >= 0.42) return "supports_existing";
   if (similarity >= 0.82) return "duplicates_existing";
   if (similarity >= 0.65) return propositionTokens(candidate).length > propositionTokens(existing.statement).length + 3

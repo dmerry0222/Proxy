@@ -86,4 +86,13 @@ export type MemoryEntityResolution = {
     | "canonical_name";
 
   matchedValue: string;
+
+  /**
+   * Set only when resolveMemoryEntityByEmail just created this entity in
+   * this call -- null for a match against a pre-existing identity. Lets
+   * callers (e.g. ingestEmail.ts's Inspector General event) distinguish
+   * "recognized an existing person" from "auto-seeded a new one," and
+   * distinguish which deterministic bootstrap path created it.
+   */
+  seededFrom?: "org_chart" | "external_correspondence" | null;
 };
