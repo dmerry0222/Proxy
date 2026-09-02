@@ -2,6 +2,8 @@ import "server-only";
 
 import { supabaseServer } from "@/lib/supabase/server";
 
+import { reviewOptionsFor } from "@/lib/memory/reviewOptions";
+
 export type MemoryReviewItem = {
   id: string;
   reviewType: string;
@@ -225,27 +227,11 @@ export async function loadMemoryReviewItems(): Promise<
       pendingContextId:
         row.pending_context_id,
 
-      options: (() => {
-        const options =
-          row.payload?.options ?? [];
-
-        /*
-         * Older claim-review rows predate the Dismiss action.
-         * Add it at read time so the restored option is available
-         * without rewriting historical payloads.
-         */
-        if (
-          row.review_type === "confirm_claim" &&
-          !options.some(
-            (option) =>
-              option.trim().toLowerCase() === "dismiss"
-          )
-        ) {
-          return [...options, "Dismiss"];
-        }
-
-        return options;
-      })(),
+      options:
+        reviewOptionsFor(
+          row.review_type,
+          row.payload?.options
+        ),
 
       createdAt:
         row.created_at,

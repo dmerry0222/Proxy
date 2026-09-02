@@ -1,6 +1,6 @@
 import "server-only";
 
-import { timingSafeEqual } from "node:crypto";
+import { secretsMatch } from "@/lib/auth/sharedSecret";
 
 /**
  * Shared-secret gate for internal/admin API routes that must not be
@@ -11,13 +11,6 @@ import { timingSafeEqual } from "node:crypto";
  */
 export class AdminAuthError extends Error {}
 
-function safeEqual(a: string, b: string): boolean {
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) return false;
-  return timingSafeEqual(bufA, bufB);
-}
-
 export function requireAdminAuth(request: Request): void {
   const expected = process.env.PROXY_ADMIN_API_TOKEN;
   if (!expected) {
@@ -27,7 +20,7 @@ export function requireAdminAuth(request: Request): void {
   const header = request.headers.get("authorization") ?? "";
   const [scheme, token] = header.split(" ");
 
-  if (scheme !== "Bearer" || !token || !safeEqual(token, expected)) {
+  if (scheme !== "Bearer" || !token || !secretsMatch(token, expected)) {
     throw new AdminAuthError("Missing or invalid Authorization bearer token.");
   }
 }

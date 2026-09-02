@@ -756,6 +756,24 @@ export default function MemoryReview({
                   </span>
                 </button>
               )}
+
+              {/*
+               * pending_context has no "Actually…" correction path, so a
+               * payload with no options renders a question with nothing
+               * under it -- the card Dave hit, unanswerable and stuck at
+               * the front of the queue. reviewOptionsFor() now backfills
+               * those options on read; this is the last line of defense,
+               * saying so instead of showing an empty box.
+               */}
+              {currentItem.options.length === 0 &&
+                currentItem.reviewType ===
+                  "pending_context" && (
+                  <p className="rounded-xl border border-neutral-800 px-4 py-3 text-xs leading-5 text-neutral-600">
+                    Proxy has no answer options for this item
+                    ({currentItem.reviewType}), so it can&apos;t be
+                    resolved here yet.
+                  </p>
+                )}
             </div>
           ) : (
             <div className="space-y-3 p-4">

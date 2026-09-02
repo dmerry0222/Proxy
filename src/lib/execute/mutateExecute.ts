@@ -2,7 +2,10 @@ import "server-only";
 
 import { buildWorkBlockCalendarPayload } from "@/lib/execute/calendarProvider";
 import { supabaseServer } from "@/lib/supabase/server";
+import { createMilestone, createProject, setMeetingPlateau } from "@/lib/execute/projects";
 import {
+  optionalDate,
+  optionalText,
   optionalUuid,
   parseChecklist,
   parseWorkBlockOutcome,
@@ -12,6 +15,25 @@ import {
 
 type ExecuteMutation =
   | { action: "activate_project"; memoryProjectEntityId?: unknown; nextPlateau?: unknown }
+  | {
+      action: "create_project";
+      title?: unknown;
+      description?: unknown;
+      desiredOutcome?: unknown;
+      whyItMatters?: unknown;
+      targetDate?: unknown;
+      nextPlateau?: unknown;
+      memoryProjectEntityId?: unknown;
+    }
+  | { action: "create_milestone"; projectStateId?: unknown; title?: unknown; description?: unknown; targetDate?: unknown }
+  | {
+      action: "set_meeting_plateau";
+      calendarEventId?: unknown;
+      projectStateId?: unknown;
+      milestoneId?: unknown;
+      desiredState?: unknown;
+      preparationNotes?: unknown;
+    }
   | { action: "create_item"; projectStateId?: unknown; title?: unknown; description?: unknown; effortMinutes?: unknown }
   | { action: "create_block"; title?: unknown; start?: unknown; end?: unknown; itemIds?: unknown; checklist?: unknown }
   | { action: "record_block_outcome"; workBlockId?: unknown; outcome?: unknown; completedItemIds?: unknown; note?: unknown; checklist?: unknown };
@@ -156,10 +178,74 @@ async function recordBlockOutcome(input: Extract<ExecuteMutation, { action: "rec
   return { workBlockId, completedItemIds: idsToComplete };
 }
 
+/**
+ * Creates a Project directly in Execute -- no Memory project entity
+ * required. `activate_project` above remains the path for promoting a
+ * project Memory already knows about; this is the path for one that starts
+ * life as work.
+ */
+async function createExecuteProject(input: Extract<ExecuteMutation, { action: "create_project" }>) {
+  const project = await createProject({
+    title: requireString(input.title, "title", 300),
+    description: optionalText(input.description, "description", 2000),
+    desiredOutcome: optionalText(input.desiredOutcome, "desiredOutcome", 2000),
+    whyItMatters: optionalText(input.whyItMatters, "whyItMatters", 2000),
+    targetDate: optionalDate(input.targetDate, "targetDate"),
+    nextPlateau: optionalText(input.nextPlateau, "nextPlateau", 500),
+    memoryProjectEntityId: optionalUuid(input.memoryProjectEntityId, "memoryProjectEntityId"),
+    createdBy: "proxy_ui",
+  });
+  return { projectStateId: project.id };
+}
+
+async function createProjectMilestone(input: Extract<ExecuteMutation, { action: "create_milestone" }>) {
+  const projectStateId = optionalUuid(input.projectStateId, "projectStateId");
+  if (!projectStateId) throw new Error("projectStateId is required");
+
+  const milestone = await createMilestone({
+    projectStateId,
+    title: requireString(input.title, "title", 300),
+    description: optionalText(input.description, "description", 2000),
+    targetDate: optionalDate(input.targetDate, "targetDate"),
+    createdBy: "proxy_ui",
+  });
+  return { milestoneId: milestone.id };
+}
+
+/**
+ * Attaches Proxy-owned meaning to a canonical Outlook meeting. Writes only
+ * execute_touchpoints -- the calendar_events row is never modified, which is
+ * why the event is referenced by id and not loaded for update.
+ */
+async function setPlateauForMeeting(input: Extract<ExecuteMutation, { action: "set_meeting_plateau" }>) {
+  const calendarEventId = requireString(input.calendarEventId, "calendarEventId", 500);
+
+  const { data: event, error } = await supabaseServer
+    .from("calendar_events")
+    .select("event_id")
+    .eq("event_id", calendarEventId)
+    .maybeSingle();
+  if (error) throw new Error(`Could not verify the calendar event: ${error.message}`);
+  if (!event) throw new Error("That calendar event does not exist");
+
+  const result = await setMeetingPlateau({
+    calendarEventId,
+    projectStateId: optionalUuid(input.projectStateId, "projectStateId"),
+    milestoneId: optionalUuid(input.milestoneId, "milestoneId"),
+    desiredState: optionalText(input.desiredState, "desiredState", 1000),
+    preparationNotes: optionalText(input.preparationNotes, "preparationNotes", 2000),
+    createdBy: "proxy_ui",
+  });
+  return { touchpointId: result.id, created: result.created };
+}
+
 export async function applyExecuteMutation(input: ExecuteMutation) {
   if (!input || typeof input !== "object" || typeof input.action !== "string") throw new Error("A valid action is required");
   switch (input.action) {
     case "activate_project": return activateProject(input);
+    case "create_project": return createExecuteProject(input);
+    case "create_milestone": return createProjectMilestone(input);
+    case "set_meeting_plateau": return setPlateauForMeeting(input);
     case "create_item": return createItem(input);
     case "create_block": return createBlock(input);
     case "record_block_outcome": return recordBlockOutcome(input);

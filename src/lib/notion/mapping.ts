@@ -144,6 +144,49 @@ export async function markPushed(
   }
 }
 
+/**
+ * Records that a mapped object was read back FROM Notion, and when the
+ * external page was last edited. Used by the pull path to keep each data
+ * source's incremental cursor without disturbing push bookkeeping.
+ */
+export async function markPulled(
+  mappingId: string,
+  params: { lastExternalUpdatedAt?: string | null; metadata?: Record<string, unknown> }
+): Promise<void> {
+  const { error } = await supabaseServer
+    .from("surface_objects")
+    .update({
+      last_pulled_at: new Date().toISOString(),
+      ...(params.lastExternalUpdatedAt ? { last_external_updated_at: params.lastExternalUpdatedAt } : {}),
+      ...(params.metadata ? { metadata: params.metadata } : {}),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", mappingId);
+
+  if (error) {
+    throw new Error(`Failed to mark surface mapping ${mappingId} pulled: ${error.message}`);
+  }
+}
+
+/**
+ * Replaces a mapping's metadata without touching sync status or hashes.
+ * Used for bookkeeping that is not itself a push -- e.g. recording which
+ * Notion views this adapter has already created on a workspace database.
+ */
+export async function updateMappingMetadata(
+  mappingId: string,
+  metadata: Record<string, unknown>
+): Promise<void> {
+  const { error } = await supabaseServer
+    .from("surface_objects")
+    .update({ metadata, updated_at: new Date().toISOString() })
+    .eq("id", mappingId);
+
+  if (error) {
+    throw new Error(`Failed to update surface mapping ${mappingId} metadata: ${error.message}`);
+  }
+}
+
 export async function markSyncError(mappingId: string, message: string): Promise<void> {
   const { error } = await supabaseServer
     .from("surface_objects")

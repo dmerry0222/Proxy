@@ -4,11 +4,14 @@ import { getProxyParentPageId, notionClient } from "./client";
 import {
   EXECUTE_PROJECTS_PROPERTIES,
   executeItemsProperties,
+  executeMeetingsProperties,
+  executeMilestonesProperties,
   executeWorkBlocksProperties,
   type DataSourcePropertySchema,
 } from "./executeSchema";
+import { EXECUTE_VIEWS, ensureViews } from "./executeViews";
 import { MAILROOM_PROPERTIES } from "./mailroomSchema";
-import { ensureSurfaceMapping, markPushed } from "./mapping";
+import { ensureSurfaceMapping, markPushed, updateMappingMetadata } from "./mapping";
 import type { NotionWorkspaceDatabaseKey, NotionWorkspaceDatabaseMetadata } from "./types";
 
 type WorkspaceDatabaseSpec = {
@@ -47,6 +50,8 @@ async function ensureWorkspaceDatabase(
     } catch (error) {
       console.error(`Could not patch Notion schema for "${spec.key}":`, error);
     }
+
+    await ensureDatabaseViews(spec.key, mapping.id, mapping.externalObjectId, mapping.metadata);
     return mapping.externalObjectId;
   }
 
@@ -72,20 +77,72 @@ async function ensureWorkspaceDatabase(
     metadata,
   });
 
+  await ensureDatabaseViews(spec.key, mapping.id, dataSourceId, metadata as unknown as Record<string, unknown>);
+
   return dataSourceId;
+}
+
+/**
+ * Seeds the human-facing views for one workspace database (Curated Execute,
+ * All Execution Items, the planning calendar, ...) and records their ids on
+ * the mapping so later sweeps skip them without any Notion calls.
+ *
+ * Never fatal: views are how the data is looked at, not what the data is, so
+ * a failure here is logged and the page projection continues.
+ */
+async function ensureDatabaseViews(
+  key: NotionWorkspaceDatabaseKey,
+  mappingId: string,
+  dataSourceId: string,
+  metadata: Record<string, unknown>
+): Promise<void> {
+  const specs = EXECUTE_VIEWS[key];
+  if (!specs?.length) return;
+
+  const existing = (metadata?.views as Record<string, string> | undefined) ?? {};
+  if (specs.every((spec) => existing[spec.name])) return;
+
+  const databaseId = typeof metadata?.databaseId === "string" ? metadata.databaseId : null;
+  if (!databaseId) {
+    console.error(`Cannot create Notion views for "${key}": no databaseId recorded on the mapping.`);
+    return;
+  }
+
+  try {
+    const result = await ensureViews({ databaseId, dataSourceId, specs, existing });
+
+    for (const failure of result.failed) {
+      console.error(`Could not create Notion view "${failure.name}" on ${key}: ${failure.message}`);
+    }
+
+    if (Object.keys(result.created).length === 0) return;
+
+    await updateMappingMetadata(mappingId, {
+      ...metadata,
+      views: { ...existing, ...result.created },
+    });
+  } catch (error) {
+    console.error(`Could not ensure Notion views for "${key}":`, error);
+  }
 }
 
 export type ExecuteWorkspaceDataSources = {
   projectsDataSourceId: string;
   itemsDataSourceId: string;
+  milestonesDataSourceId: string;
+  meetingsDataSourceId: string;
   workBlocksDataSourceId: string;
 };
 
 /**
- * Ensures the three Execute databases (Projects, Execution Items, Work
- * Blocks) exist under the Proxy parent page, creating whichever are
- * missing. Safe to call on every sync run -- after the first successful
- * run this is just three surface_objects lookups, no Notion API calls.
+ * Ensures the five Execute databases (Projects, Execution Items, Milestones,
+ * Meetings, Work Blocks) exist under the Proxy parent page, creating whichever
+ * are missing, and seeds their views. Safe to call on every sync run -- after
+ * the first successful run this is just five surface_objects lookups and no
+ * Notion API calls, because both the schema patch and the view seeding are
+ * skipped once everything is present.
+ *
+ * Order matters: Milestones relates to Projects, and Meetings relates to both.
  */
 export async function ensureExecuteWorkspace(): Promise<ExecuteWorkspaceDataSources> {
   const projectsDataSourceId = await ensureWorkspaceDatabase(
@@ -98,12 +155,28 @@ export async function ensureExecuteWorkspace(): Promise<ExecuteWorkspaceDataSour
     () => executeItemsProperties(projectsDataSourceId)
   );
 
+  const milestonesDataSourceId = await ensureWorkspaceDatabase(
+    { key: "execute_milestones", title: "Execute – Milestones" },
+    () => executeMilestonesProperties(projectsDataSourceId)
+  );
+
+  const meetingsDataSourceId = await ensureWorkspaceDatabase(
+    { key: "execute_meetings", title: "Execute – Meetings" },
+    () => executeMeetingsProperties(projectsDataSourceId, milestonesDataSourceId)
+  );
+
   const workBlocksDataSourceId = await ensureWorkspaceDatabase(
     { key: "execute_work_blocks", title: "Execute – Work Blocks" },
     () => executeWorkBlocksProperties(projectsDataSourceId, itemsDataSourceId)
   );
 
-  return { projectsDataSourceId, itemsDataSourceId, workBlocksDataSourceId };
+  return {
+    projectsDataSourceId,
+    itemsDataSourceId,
+    milestonesDataSourceId,
+    meetingsDataSourceId,
+    workBlocksDataSourceId,
+  };
 }
 
 /**

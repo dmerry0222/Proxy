@@ -16,6 +16,25 @@ export function optionalUuid(value: unknown, name: string) {
   return text;
 }
 
+export function optionalText(value: unknown, name: string, max: number) {
+  if (value == null || value === "") return null;
+  if (typeof value !== "string") throw new Error(`${name} must be text`);
+  const text = value.trim();
+  if (!text) return null;
+  if (text.length > max) throw new Error(`${name} must be at most ${max} characters`);
+  return text;
+}
+
+/** A calendar DATE (no time), which is what a target date is. */
+export function optionalDate(value: unknown, name: string) {
+  if (value == null || value === "") return null;
+  const text = requireString(value, name, 40);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text.slice(0, 10)) || Number.isNaN(new Date(text).getTime())) {
+    throw new Error(`${name} must be a YYYY-MM-DD date`);
+  }
+  return text.slice(0, 10);
+}
+
 export function requireTimestamp(value: unknown, name: string) {
   const text = requireString(value, name, 50);
   const date = new Date(text);

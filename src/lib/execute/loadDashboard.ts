@@ -1,6 +1,7 @@
 import "server-only";
 
 import { supabaseServer } from "@/lib/supabase/server";
+import { resolveProjectTitle } from "@/lib/execute/projects";
 import type {
   ExecuteDashboard,
   ExecuteItem,
@@ -25,13 +26,17 @@ export async function loadExecuteDashboard(): Promise<ExecuteDashboard> {
   horizonEnd.setDate(horizonEnd.getDate() + 28);
 
   const [projectResult, memoryProjectResult, itemResult, blockResult, eventResult, touchpointResult] = await Promise.all([
+    /*
+     * LEFT join: a Project no longer requires a Memory entity, so !inner
+     * would silently hide every project created in Execute or in Notion.
+     */
     supabaseServer.from("execute_project_states")
-      .select("id, memory_project_entity_id, next_plateau, priority_directive, memory_entities!inner(canonical_name)")
+      .select("id, memory_project_entity_id, title, next_plateau, priority_directive, memory_entities!execute_project_states_memory_project_entity_id_fkey(canonical_name)")
       .eq("status", "active").order("updated_at", { ascending: false }),
     supabaseServer.from("memory_entities").select("id, canonical_name")
       .eq("entity_type", "project").neq("status", "merged").order("canonical_name"),
     supabaseServer.from("execution_items")
-      .select("id, project_state_id, title, description, status, responsibility, confirmed_by_user, effort_minutes, timing_kind, timing_at, critical_rank, waiting_since, expected_at, related_person_entity_id, deferred_until, priority_directive, execute_project_states(memory_entities(canonical_name)), execute_work_block_items(allocated_minutes, execute_work_blocks!inner(status))")
+      .select("id, project_state_id, title, description, status, responsibility, confirmed_by_user, effort_minutes, timing_kind, timing_at, critical_rank, waiting_since, expected_at, related_person_entity_id, deferred_until, priority_directive, execute_project_states(memory_entities!execute_project_states_memory_project_entity_id_fkey(canonical_name)), execute_work_block_items(allocated_minutes, execute_work_blocks!inner(status))")
       .in("status", ["candidate", "active", "deferred"]).order("created_at", { ascending: true }),
     supabaseServer.from("execute_work_blocks")
       .select("id, title, status, planned_start, planned_end, calendar_event_id, checklist, completion_note, calendar_events(start_time, end_time), execute_work_block_items(allocated_minutes, position, execution_items(id, title, status))")
@@ -50,11 +55,10 @@ export async function loadExecuteDashboard(): Promise<ExecuteDashboard> {
 
   const projectNames = new Map<string, string>();
   const projects = (projectResult.data ?? []).map((row) => {
-    const memory = Array.isArray(row.memory_entities) ? row.memory_entities[0] : row.memory_entities;
     const project: ExecuteProject = {
       id: row.id,
       memoryProjectEntityId: row.memory_project_entity_id,
-      name: memory?.canonical_name ?? "Untitled project",
+      name: resolveProjectTitle(row),
       nextPlateau: row.next_plateau,
       priorityDirective: row.priority_directive as ExecuteProject["priorityDirective"],
     };

@@ -23,8 +23,17 @@ export function comparableValue(property: any): ComparableValue {
       return property.checkbox === true;
     case "rich_text":
       return (property.rich_text ?? []).map((chunk: any) => chunk?.plain_text ?? "").join("") || null;
+    // Titles are guardable too: a project renamed in Notion is a real edit,
+    // and without this it compared as null and could never be preserved.
+    case "title":
+      return (property.title ?? []).map((chunk: any) => chunk?.plain_text ?? "").join("") || null;
     case "date":
       return property.date?.start ?? null;
+    // Single-target relations only (every relation Proxy writes is one page
+    // or none), which is enough to notice "Dave filed this under a different
+    // project" and leave his choice alone.
+    case "relation":
+      return property.relation?.[0]?.id ?? null;
     default:
       return null;
   }
@@ -77,6 +86,10 @@ export function dateProperty(iso: string | null | undefined) {
 
 export function numberProperty(value: number | null | undefined) {
   return { type: "number" as const, number: value ?? null };
+}
+
+export function urlProperty(url: string | null | undefined) {
+  return { type: "url" as const, url: url || null };
 }
 
 export function relationProperty(pageId: string | null | undefined) {

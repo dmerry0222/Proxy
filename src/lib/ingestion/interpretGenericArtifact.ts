@@ -5,6 +5,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { ParsedSection } from "@/lib/ingestion/types";
 import { resolveMemoryEntityByEmail } from "@/lib/memory/resolveEntity";
 import { reconcileMemoryClaim } from "@/lib/memory/claimReconciliation";
+import { CLAIM_REVIEW_OPTIONS, PENDING_CONTEXT_REVIEW_OPTIONS } from "@/lib/memory/reviewOptions";
 import { supabaseServer } from "@/lib/supabase/server";
 import { gatesDaveOwnership } from "@/lib/reconciliation/ownershipRules";
 import { recordExecutionEvidence } from "@/lib/reconciliation/evidence";
@@ -166,7 +167,7 @@ Pending context: {"summary":"...","detail":null,"contextType":"follow_up|waiting
         evidenceMetadata: { extraction_type: "artifact_claim_candidate", ingestion_version: INTERPRETATION_VERSION },
         claimMetadata: { source_type: "artifact", source_id: sourceId, ingestion_version: INTERPRETATION_VERSION },
         reviewTitle: "Review artifact Memory", reviewPriority: 45,
-        reviewPayload: { options: ["Confirm", "Outdated", "Keep as evidence", "Not sure", "Dismiss"],
+        reviewPayload: { options: [...CLAIM_REVIEW_OPTIONS],
           generated_by: "artifact_ingestion", source_title: title, source_date: occurredAt },
       });
       if (result.claimCreated) claimsCreated += 1;
@@ -190,7 +191,8 @@ Pending context: {"summary":"...","detail":null,"contextType":"follow_up|waiting
       const { error: reviewError } = await supabaseServer.from("memory_review_items").insert({
         review_type: "pending_context", status: "pending", title: "Review artifact context",
         prompt: context.summary.trim(), pending_context_id: pending.id, priority: 50,
-        payload: { generated_by: "artifact_ingestion", source_title: title },
+        payload: { options: [...PENDING_CONTEXT_REVIEW_OPTIONS],
+          generated_by: "artifact_ingestion", source_title: title },
       });
       if (reviewError) throw new Error(`Could not create pending-context review: ${reviewError.message}`);
       pendingContextCreated += 1;

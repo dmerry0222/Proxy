@@ -1,6 +1,9 @@
 import "server-only";
 
 import { startTrace, completeTrace } from "@/lib/diagnostics/emitEvent";
+import { ingestMailroomNeedsAttention } from "@/lib/execute/mailroomIntake";
+import { refreshExecuteCuration } from "@/lib/execute/refreshCuration";
+import { pullExecuteFromNotion } from "@/lib/notion/pullExecute";
 import { syncExecuteToNotion } from "@/lib/notion/syncExecute";
 import { syncMailroomToNotion } from "@/lib/notion/syncMailroom";
 
@@ -20,9 +23,43 @@ async function runSweep(): Promise<void> {
   const traceId = await startTrace({
     module: "notion",
     sourceType: "scheduled_sweep",
-    summary: "Periodic Execute + Mailroom -> Notion surface sweep",
+    summary: "Periodic Execute cycle: Notion pull, Mailroom intake, curation, Notion push",
   });
   try {
+    /*
+     * Order matters, and it is a cycle rather than a push:
+     *
+     *   1. PULL   -- adopt what Dave changed in Notion (planning dates,
+     *                project filing, plateaus) before anything recomputes on
+     *                top of stale state.
+     *   2. INTAKE -- turn newly classified Needs Attention mail into durable
+     *                execution items.
+     *   3. CURATE -- decide what deserves the curated surface, now that both
+     *                human input and new work are in.
+     *   4. PUSH   -- project the result back out.
+     *
+     * Each stage is caught on its own: a Notion outage must not stop intake
+     * from happening, and a Mailroom problem must not stop the projection.
+     */
+    let pullSummary = "";
+    try {
+      const pull = await pullExecuteFromNotion({ dryRun: false, traceId });
+      pullSummary = ` Pull: ${pull.projects.changed + pull.items.changed + pull.milestones.changed + pull.meetings.changed} change(s), ${pull.projects.adopted + pull.milestones.adopted} adopted.`;
+    } catch (error) {
+      console.error("Notion -> Execute pull failed:", error);
+      pullSummary = ` Pull failed: ${error instanceof Error ? error.message : "Unknown error"}`;
+    }
+
+    let intakeSummary = "";
+    try {
+      const intake = await ingestMailroomNeedsAttention();
+      const curation = await refreshExecuteCuration();
+      intakeSummary = ` Intake: ${intake.created} created, ${intake.refreshed} refreshed, ${intake.withdrawn} withdrawn. Curation: ${curation.curated} curated / ${curation.suppressed} suppressed (${curation.changed} changed).`;
+    } catch (error) {
+      console.error("Mailroom -> Execute intake failed:", error);
+      intakeSummary = ` Intake failed: ${error instanceof Error ? error.message : "Unknown error"}`;
+    }
+
     const execute = await syncExecuteToNotion({ dryRun: false, traceId });
 
     /*
@@ -51,7 +88,7 @@ async function runSweep(): Promise<void> {
 
     await completeTrace(traceId, {
       status: execute.errors.length || mailroomFailed ? "failed" : "completed",
-      summary: `Execute: ${execute.projects.created + execute.items.created + execute.workBlocks.created} created, ${execute.projects.updated + execute.items.updated + execute.workBlocks.updated} updated, ${execute.projects.skipped + execute.items.skipped + execute.workBlocks.skipped} unchanged, ${execute.errors.length} failed.${mailroomSummary}`,
+      summary: `Execute: ${execute.projects.created + execute.items.created + execute.milestones.created + execute.meetings.created + execute.workBlocks.created} created, ${execute.projects.updated + execute.items.updated + execute.milestones.updated + execute.meetings.updated + execute.workBlocks.updated} updated, ${execute.projects.skipped + execute.items.skipped + execute.milestones.skipped + execute.meetings.skipped + execute.workBlocks.skipped} unchanged, ${execute.errors.length} failed.${pullSummary}${intakeSummary}${mailroomSummary}`,
     });
   } catch (error) {
     console.error("Notion sync sweep failed:", error);
@@ -60,10 +97,16 @@ async function runSweep(): Promise<void> {
 }
 
 /**
- * Keeps the Notion surfaces -- Execute (Projects/Execution Items/Work
- * Blocks) and Mailroom (conversations) -- synchronized without requiring
- * every mutation path (reconciliation, CoS, review actions, Mailroom
- * analysis runs, manual Execute mutations) to know how to talk to Notion.
+ * Runs the Execute cycle -- pull human edits from Notion, take in newly
+ * classified Needs Attention mail, recompute curation, push everything back
+ * out -- plus the Mailroom projection, without requiring every mutation path
+ * (reconciliation, CoS, review actions, Mailroom analysis runs, manual
+ * Execute mutations) to know how to talk to Notion.
+ *
+ * For anyone tempted to replace this with a scheduled job: this project is on
+ * Vercel Hobby, where a cron more frequent than daily breaks the deployment.
+ * Recurring work belongs to this in-process sweep or an external scheduler
+ * (Power Automate, Supabase), not to a new vercel.json cron entry.
  *
  * No cron/scheduled-job framework exists anywhere in this repo, and this
  * app runs as a long-lived Node process (the same assumption

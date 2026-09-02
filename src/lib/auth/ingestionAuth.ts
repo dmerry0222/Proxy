@@ -1,6 +1,6 @@
 import "server-only";
 
-import { timingSafeEqual } from "node:crypto";
+import { secretsMatch } from "@/lib/auth/sharedSecret";
 
 /**
  * Shared-secret gate for trusted machine-to-machine ingestion (Power
@@ -27,15 +27,6 @@ export class IngestionAuthError extends Error {
 
 export const INGESTION_SECRET_HEADER = "x-proxy-ingestion-secret";
 
-function safeEqual(a: string, b: string): boolean {
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  // Compare lengths first: timingSafeEqual throws on a length mismatch, and
-  // the length of a rejected secret is not worth protecting.
-  if (bufA.length !== bufB.length) return false;
-  return timingSafeEqual(bufA, bufB);
-}
-
 export function requireIngestionSecret(request: Request): void {
   const expected = process.env.PROXY_INGESTION_SECRET;
   if (!expected) {
@@ -49,7 +40,7 @@ export function requireIngestionSecret(request: Request): void {
     throw new IngestionAuthError(`Missing ${INGESTION_SECRET_HEADER} header.`, false);
   }
 
-  if (!safeEqual(provided, expected)) {
+  if (!secretsMatch(provided, expected)) {
     throw new IngestionAuthError(`Invalid ${INGESTION_SECRET_HEADER} header.`, true);
   }
 }

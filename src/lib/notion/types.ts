@@ -6,6 +6,7 @@ export type SurfaceObjectType =
   | "notion_workspace_database"
   | "execute_project"
   | "execute_item"
+  | "execute_milestone"
   | "execute_work_block"
   | "mailroom_conversation"
   | "calendar_event";
@@ -19,6 +20,8 @@ export type SurfaceObjectType =
 export type NotionWorkspaceDatabaseKey =
   | "execute_projects"
   | "execute_items"
+  | "execute_milestones"
+  | "execute_meetings"
   | "execute_work_blocks"
   | "mailroom_conversations";
 
@@ -47,4 +50,12 @@ export type SurfaceObjectRecord = {
 export type NotionWorkspaceDatabaseMetadata = {
   databaseId: string;
   dataSourceId: string;
+  /**
+   * Views this adapter has already created on the database, keyed by view
+   * name. Notion's view list endpoint returns bare {object, id} references
+   * with no name, so "have I made this view already?" is not answerable from
+   * the API without retrieving every view -- recording the ids here keeps
+   * ensureViews idempotent at zero API cost on the steady-state path.
+   */
+  views?: Record<string, string>;
 };

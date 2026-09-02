@@ -58,6 +58,21 @@ const HEALTH_CHECKS: Array<{
     sourceType: null,
     staleAfterMs: 1000 * 60 * 60 * 24 * 7,
   },
+  {
+    key: "capture",
+    label: "Capture",
+    module: "capture",
+    sourceType: "capture",
+    /*
+     * A fortnight, not a day. Capture is human-driven and bursty -- a quiet
+     * week means Dave had a quiet week, not that the front door is broken --
+     * so a short staleness window would cry wolf constantly. What this tile
+     * is really watching for is the failure mode that matters: captures that
+     * arrive and fail, which shows up as "degraded"/"failing" immediately
+     * regardless of the staleness window.
+     */
+    staleAfterMs: 1000 * 60 * 60 * 24 * 14,
+  },
 ];
 
 async function computeHealthTile(

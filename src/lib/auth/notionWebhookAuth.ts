@@ -1,7 +1,6 @@
 import "server-only";
 
-import { timingSafeEqual } from "node:crypto";
-
+import { secretsMatch } from "@/lib/auth/sharedSecret";
 import { getNotionWebhookSecret } from "@/lib/notion/client";
 
 /**
@@ -15,13 +14,6 @@ import { getNotionWebhookSecret } from "@/lib/notion/client";
  */
 export class NotionWebhookAuthError extends Error {}
 
-function safeEqual(a: string, b: string): boolean {
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) return false;
-  return timingSafeEqual(bufA, bufB);
-}
-
 export function requireNotionWebhookAuth(request: Request): void {
   let expected: string;
   try {
@@ -31,7 +23,7 @@ export function requireNotionWebhookAuth(request: Request): void {
   }
 
   const provided = request.headers.get("NOTION_WEBHOOK_SECRET");
-  if (!provided || !safeEqual(provided, expected)) {
+  if (!provided || !secretsMatch(provided, expected)) {
     throw new NotionWebhookAuthError("Missing or invalid NOTION_WEBHOOK_SECRET header.");
   }
 }
