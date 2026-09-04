@@ -437,7 +437,7 @@ async function pullMilestones(dryRun: boolean, summary: PullExecuteSummary): Pro
   if (!dryRun) await markPulled(source.mapping.id, {});
 }
 
-const MEETING_GUARDED = ["Related Project", "Related Milestone", "Plateau Required", "Preparation Notes", "Reviewed"];
+const MEETING_GUARDED = ["Related Project", "Related Milestone", "Plateau Required", "Preparation Notes"];
 
 async function pullMeetings(dryRun: boolean, summary: PullExecuteSummary): Promise<void> {
   const source = await resolveSource("execute_meetings");

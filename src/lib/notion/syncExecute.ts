@@ -98,7 +98,6 @@ type TouchpointRow = {
   milestone_id: string | null;
   desired_state: string | null;
   preparation_notes: string | null;
-  reviewed: boolean | null;
 };
 
 type WorkBlockRow = {
@@ -524,7 +523,7 @@ async function syncMeetings(
    */
   const { data: touchpoints, error: touchpointError } = await supabaseServer
     .from("execute_touchpoints")
-    .select("calendar_event_id, project_state_id, milestone_id, desired_state, preparation_notes, reviewed")
+    .select("calendar_event_id, project_state_id, milestone_id, desired_state, preparation_notes")
     .returns<TouchpointRow[]>();
 
   if (touchpointError) {
@@ -563,7 +562,6 @@ async function syncMeetings(
       milestonePageId: milestoneMapping?.externalObjectId ?? null,
       plateau: touchpoint?.desired_state ?? null,
       preparationNotes: touchpoint?.preparation_notes ?? null,
-      reviewed: touchpoint?.reviewed === true,
     };
 
     const action = await syncOne({
@@ -586,11 +584,10 @@ async function syncMeetings(
         "Related Milestone": relationProperty(canonicalFields.milestonePageId),
         "Plateau Required": richTextProperty(canonicalFields.plateau),
         "Preparation Notes": richTextProperty(canonicalFields.preparationNotes),
-        Reviewed: checkboxProperty(canonicalFields.reviewed),
         "Outlook Event ID": richTextProperty(row.event_id),
         Link: urlProperty(canonicalFields.link),
       }),
-      guardedProperties: ["Related Project", "Related Milestone", "Plateau Required", "Preparation Notes", "Reviewed"],
+      guardedProperties: ["Related Project", "Related Milestone", "Plateau Required", "Preparation Notes"],
     });
 
     counts[action] += 1;
