@@ -48,9 +48,13 @@ function checkboxState(content: string): "complete" | "incomplete" | null {
 function taskTitle(content: string): string {
   const checkbox = content.trim().match(CHECKBOX_LINE);
   const withoutCheckbox = checkbox ? checkbox[2] : content.trim();
-  const withoutHeading = withoutCheckbox.replace(HEADING_LINE, (_, rest) => rest).trim();
-  const firstLine = withoutHeading.split("\n")[0].trim();
-  return (firstLine || withoutHeading || content.trim()).slice(0, 500);
+  // HEADING_LINE has no multiline flag, so it only strips a heading marker
+  // that spans the whole (single-line) string -- apply it per-line instead
+  // so a heading followed by more lines (e.g. a multi-task capture) still
+  // gets its leading "#" stripped from the title.
+  const lines = withoutCheckbox.split("\n").map((line) => line.replace(HEADING_LINE, (_, rest) => rest).trim());
+  const firstLine = lines.find((line) => line.length > 0) ?? "";
+  return (firstLine || withoutCheckbox.trim() || content.trim()).slice(0, 500);
 }
 
 function isTaskShaped(capture: CaptureRecord): boolean {
