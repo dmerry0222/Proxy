@@ -274,8 +274,11 @@ export type PlateauInput = {
   /** The plateau: what state the project must be in by this meeting. */
   desiredState?: string | null;
   preparationNotes?: string | null;
+  reviewed?: boolean;
   createdBy?: "ai" | "notion" | "proxy_ui";
   confidence?: number | null;
+  /** The Notion page this write originated from, for the audit trail. Null for a non-Notion write. */
+  notionPageId?: string | null;
 };
 
 /**
@@ -291,22 +294,60 @@ export type PlateauInput = {
  * project-less enrichment is kept single per event by a partial unique index,
  * so "notes on this meeting, no project yet" cannot silently multiply.
  */
+const AUDITED_FIELDS = ["project_state_id", "milestone_id", "desired_state", "preparation_notes", "reviewed"] as const;
+
+async function recordTouchpointAudit(input: {
+  touchpointId: string;
+  calendarEventId: string;
+  notionPageId: string | null;
+  source: "notion" | "proxy_ui" | "ai" | "system";
+  previous: Record<string, unknown>;
+  next: Record<string, unknown>;
+}): Promise<void> {
+  const rows = AUDITED_FIELDS.filter((field) => (input.previous[field] ?? null) !== (input.next[field] ?? null)).map(
+    (field) => ({
+      touchpoint_id: input.touchpointId,
+      calendar_event_id: input.calendarEventId,
+      notion_page_id: input.notionPageId,
+      field,
+      previous_value: input.previous[field] === null || input.previous[field] === undefined ? null : String(input.previous[field]),
+      new_value: input.next[field] === null || input.next[field] === undefined ? null : String(input.next[field]),
+      source: input.source,
+      human_confirmed: input.source === "notion" || input.source === "proxy_ui",
+    })
+  );
+  if (!rows.length) return;
+  const { error } = await supabaseServer.from("execute_touchpoint_audit").insert(rows);
+  if (error) console.error("Could not record execute_touchpoint_audit rows:", error.message);
+}
+
+/**
+ * Writes one meeting's enrichment row whole (see PlateauInput doc) and, for
+ * every guarded field that actually changed, one execute_touchpoint_audit
+ * row -- add/change/clear are all just a previous/new value pair, clearing
+ * being new_value: null. Priority 6: this audit trail was the real gap in an
+ * otherwise-already-safe mechanism (guarded-baseline diffing, no Outlook
+ * write-back) that had been live since 2026-09-02 with no history at all.
+ */
 export async function setMeetingPlateau(input: PlateauInput): Promise<{ id: string; created: boolean }> {
   const { data: existing, error: existingError } = await (input.projectStateId
     ? supabaseServer
         .from("execute_touchpoints")
-        .select("id")
+        .select("id, project_state_id, milestone_id, desired_state, preparation_notes, reviewed")
         .eq("calendar_event_id", input.calendarEventId)
         .eq("project_state_id", input.projectStateId)
         .maybeSingle()
     : supabaseServer
         .from("execute_touchpoints")
-        .select("id")
+        .select("id, project_state_id, milestone_id, desired_state, preparation_notes, reviewed")
         .eq("calendar_event_id", input.calendarEventId)
         .is("project_state_id", null)
         .maybeSingle());
 
   if (existingError) throw new Error(`Could not look up meeting enrichment: ${existingError.message}`);
+
+  const source: "notion" | "proxy_ui" | "ai" | "system" =
+    input.createdBy === "notion" ? "notion" : input.createdBy === "ai" ? "ai" : "proxy_ui";
 
   const payload = {
     calendar_event_id: input.calendarEventId,
@@ -314,6 +355,7 @@ export async function setMeetingPlateau(input: PlateauInput): Promise<{ id: stri
     milestone_id: input.milestoneId ?? null,
     desired_state: input.desiredState?.trim() || null,
     preparation_notes: input.preparationNotes?.trim() || null,
+    reviewed: input.reviewed ?? false,
     created_by: input.createdBy ?? "proxy_ui",
     confidence: input.confidence ?? null,
     updated_at: new Date().toISOString(),
@@ -322,11 +364,27 @@ export async function setMeetingPlateau(input: PlateauInput): Promise<{ id: stri
   if (existing) {
     const { error } = await supabaseServer.from("execute_touchpoints").update(payload).eq("id", existing.id);
     if (error) throw new Error(`Could not update meeting enrichment: ${error.message}`);
+    await recordTouchpointAudit({
+      touchpointId: existing.id as string,
+      calendarEventId: input.calendarEventId,
+      notionPageId: input.notionPageId ?? null,
+      source,
+      previous: existing,
+      next: payload,
+    });
     return { id: existing.id as string, created: false };
   }
 
   const { data, error } = await supabaseServer.from("execute_touchpoints").insert(payload).select("id").single();
   if (error || !data) throw new Error(`Could not create meeting enrichment: ${error?.message ?? "Unknown error"}`);
+  await recordTouchpointAudit({
+    touchpointId: data.id as string,
+    calendarEventId: input.calendarEventId,
+    notionPageId: input.notionPageId ?? null,
+    source,
+    previous: { project_state_id: null, milestone_id: null, desired_state: null, preparation_notes: null, reviewed: false },
+    next: payload,
+  });
   return { id: data.id as string, created: true };
 }
 

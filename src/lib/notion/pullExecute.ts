@@ -1,6 +1,6 @@
 import "server-only";
 
-import { emitDiagnosticEvent } from "@/lib/diagnostics/emitEvent";
+import { emitDiagnosticEvent, recordOrUpdateIssue, resolveIssueByDedupKey } from "@/lib/diagnostics/emitEvent";
 import {
   createMilestone,
   createProject,
@@ -99,6 +99,11 @@ function selectName(properties: any, key: string): string | null {
 function relationPageId(properties: any, key: string): string | null {
   const property = properties?.[key];
   return property?.type === "relation" ? property.relation?.[0]?.id ?? null : null;
+}
+
+function checkboxValue(properties: any, key: string): boolean {
+  const property = properties?.[key];
+  return property?.type === "checkbox" ? property.checkbox === true : false;
 }
 
 function baselineOf(mapping: SurfaceObjectRecord): Record<string, ComparableValue> {
@@ -432,7 +437,7 @@ async function pullMilestones(dryRun: boolean, summary: PullExecuteSummary): Pro
   if (!dryRun) await markPulled(source.mapping.id, {});
 }
 
-const MEETING_GUARDED = ["Related Project", "Related Milestone", "Plateau Required", "Preparation Notes"];
+const MEETING_GUARDED = ["Related Project", "Related Milestone", "Plateau Required", "Preparation Notes", "Reviewed"];
 
 async function pullMeetings(dryRun: boolean, summary: PullExecuteSummary): Promise<void> {
   const source = await resolveSource("execute_meetings");
@@ -465,6 +470,34 @@ async function pullMeetings(dryRun: boolean, summary: PullExecuteSummary): Promi
     }
 
     try {
+      const relatedProjectPageId = relationPageId(page.properties, "Related Project");
+      const relatedMilestonePageId = relationPageId(page.properties, "Related Milestone");
+      const [projectStateId, milestoneId] = await Promise.all([
+        projectStateIdForPage(relatedProjectPageId),
+        milestoneIdForPage(relatedMilestonePageId),
+      ]);
+
+      // A relation was set in Notion but doesn't resolve to a known Proxy
+      // object -- surfaced in Inspector General rather than silently dropped
+      // (the guarded write still proceeds with that one relation left
+      // unset, same as an absent relation).
+      const invalidDedupKey = `notion_calendar_invalid_relation:${page.id}`;
+      if ((relatedProjectPageId && !projectStateId) || (relatedMilestonePageId && !milestoneId)) {
+        await recordOrUpdateIssue(invalidDedupKey, {
+          issueType: "notion_calendar_invalid_relation",
+          severity: "warning",
+          humanSummary: `Meeting page's Related Project/Milestone points at a Notion page with no known Proxy object.`,
+          technicalDetail: `relatedProjectPageId=${relatedProjectPageId ?? "none"} resolved=${projectStateId ?? "none"}; relatedMilestonePageId=${relatedMilestonePageId ?? "none"} resolved=${milestoneId ?? "none"}`,
+          objectType: "calendar_event",
+          objectId: mapping.proxyObjectId,
+          sourceType: "notion",
+          sourceId: page.id,
+          retryable: false,
+        });
+      } else {
+        await resolveIssueByDedupKey(invalidDedupKey, "Relation now resolves to a known Proxy object.");
+      }
+
       /*
        * The enrichment row is written whole, from the page's current state:
        * project, milestone, plateau and prep notes describe one meeting
@@ -474,11 +507,13 @@ async function pullMeetings(dryRun: boolean, summary: PullExecuteSummary): Promi
        */
       await setMeetingPlateau({
         calendarEventId: mapping.proxyObjectId,
-        projectStateId: await projectStateIdForPage(relationPageId(page.properties, "Related Project")),
-        milestoneId: await milestoneIdForPage(relationPageId(page.properties, "Related Milestone")),
+        projectStateId,
+        milestoneId,
         desiredState: plainText(page.properties, "Plateau Required"),
         preparationNotes: plainText(page.properties, "Preparation Notes"),
+        reviewed: checkboxValue(page.properties, "Reviewed"),
         createdBy: "notion",
+        notionPageId: page.id,
       });
 
       await releaseBaselines(mapping, changed);
