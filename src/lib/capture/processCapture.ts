@@ -73,44 +73,20 @@ async function createTaskFromCapture(capture: CaptureRecord): Promise<CaptureOut
   const state = checkboxState(capture.content);
   const status = state === "complete" ? "completed" : "candidate";
 
-  const { data: inserted, error } = await supabaseServer
-    .from("execution_items")
-    .upsert(
-      {
-        title: taskTitle(capture.content),
-        description: null,
-        status,
-        responsibility: "mine",
-        confirmed_by_user: true,
-        extraction_basis: "capture",
-        source_system: "capture",
-        source_ref: capture.id,
-        why_surfaced: `Captured via ${capture.source}${capture.captureType ? ` (${capture.captureType})` : ""}.`,
-        metadata: { capture_source: capture.source, capture_type: capture.captureType },
-      },
-      { onConflict: "source_system,source_ref", ignoreDuplicates: true }
-    )
-    .select("id")
-    .maybeSingle();
+  const { data, error } = await supabaseServer.rpc("upsert_capture_execution_item", {
+    p_capture_id: capture.id,
+    p_title: taskTitle(capture.content),
+    p_status: status,
+    p_why_surfaced: `Captured via ${capture.source}${capture.captureType ? ` (${capture.captureType})` : ""}.`,
+    p_metadata: { capture_source: capture.source, capture_type: capture.captureType },
+  });
 
   if (error) throw new Error(`Could not create execution item from capture: ${error.message}`);
+  const row = (data as Array<{ item_id: string; was_created: boolean }> | null)?.[0];
+  if (!row) throw new Error("upsert_capture_execution_item returned no row.");
 
-  let executionItemId = inserted?.id as string | undefined;
-  let created = Boolean(inserted);
-
-  if (!executionItemId) {
-    const { data: existing, error: lookupError } = await supabaseServer
-      .from("execution_items")
-      .select("id")
-      .eq("source_system", "capture")
-      .eq("source_ref", capture.id)
-      .maybeSingle();
-    if (lookupError || !existing) {
-      throw new Error(`Could not resolve existing execution item for capture: ${lookupError?.message ?? "not found"}`);
-    }
-    executionItemId = existing.id as string;
-    created = false;
-  }
+  const executionItemId = row.item_id;
+  const created = row.was_created;
 
   await recordExecutionEvidence({
     executionItemId,
