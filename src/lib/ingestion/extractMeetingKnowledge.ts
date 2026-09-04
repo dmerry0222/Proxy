@@ -1,7 +1,6 @@
 import "server-only";
 
-import Anthropic from "@anthropic-ai/sdk";
-
+import { callStructuredExtraction } from "@/lib/ingestion/structuredExtraction";
 import { resolveMemoryEntityByEmail } from "@/lib/memory/resolveEntity";
 import { reconcileMemoryClaim } from "@/lib/memory/claimReconciliation";
 import { supabaseServer } from "@/lib/supabase/server";
@@ -41,10 +40,62 @@ type ExtractedClaim = {
   evidenceStrength?: string;
 };
 
-function parseJson(raw: string): { tasks?: ExtractedTask[]; claims?: ExtractedClaim[] } {
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
-  const candidate = fenced ?? raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1);
-  return JSON.parse(candidate.trim());
+type ExtractedResult = { tasks?: ExtractedTask[]; claims?: ExtractedClaim[] };
+
+const EXTRACTION_TOOL_NAME = "record_meeting_extraction";
+
+const EXTRACTION_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    tasks: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          description: { type: ["string", "null"] },
+          assigneeEmail: { type: ["string", "null"] },
+          dueAt: { type: ["string", "null"] },
+          priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
+          evidence: { type: "string" },
+          sectionOrdinal: { type: "number" },
+          confidence: { type: "number" },
+          owner: { type: "string" },
+          ownershipBasis: { type: "string", enum: ["explicit_assignment_to_dave", "explicit_acceptance_by_dave"] },
+          ownershipEvidence: { type: "string" },
+        },
+      },
+    },
+    claims: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          statement: { type: "string" },
+          claimType: { type: "string" },
+          subjectEmail: { type: "string" },
+          evidence: { type: "string" },
+          sectionOrdinal: { type: "number" },
+          evidenceStrength: { type: "string", enum: ["weak", "moderate", "strong"] },
+        },
+      },
+    },
+  },
+  required: ["tasks", "claims"],
+};
+
+function validateExtraction(input: unknown): { ok: true; data: ExtractedResult } | { ok: false; error: string } {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return { ok: false, error: "extraction input is not an object" };
+  }
+  const value = input as Record<string, unknown>;
+  if (value.tasks !== undefined && !Array.isArray(value.tasks)) {
+    return { ok: false, error: "tasks is present but not an array" };
+  }
+  if (value.claims !== undefined && !Array.isArray(value.claims)) {
+    return { ok: false, error: "claims is present but not an array" };
+  }
+  return { ok: true, data: { tasks: value.tasks as ExtractedTask[] | undefined, claims: value.claims as ExtractedClaim[] | undefined } };
 }
 
 export async function extractMeetingKnowledge({
@@ -82,21 +133,22 @@ export async function extractMeetingKnowledge({
   const counters = emptyCounters();
 
   try {
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    const response = await anthropic.messages.create({
+    const extracted = await callStructuredExtraction({
       model: MODEL_NAME,
-      max_tokens: 1800,
+      maxTokens: 1800,
+      toolName: EXTRACTION_TOOL_NAME,
+      toolDescription: "Record the tasks and Memory claims extracted from this meeting artifact.",
+      inputSchema: EXTRACTION_INPUT_SCHEMA,
+      validate: validateExtraction,
       system: `Extract actionable work and durable Memory candidates from meeting artifacts for Dave Merry's AI Chief of Staff.
 TASKS: Create an execution candidate only when the action belongs to Dave, was explicitly assigned to Dave, or was explicitly accepted by Dave. Never create Dave tasks from recommendations, instructions, action-oriented prose, or responsibilities belonging to somebody else. Uncertain ownership means no task. Preserve Dave's email only when supplied. Resolve relative dates from the meeting date. A task must stand alone and include exact ownership evidence.
 CLAIMS: Be conservative. Extract at most 4 durable facts about a supplied participant: roles, ongoing responsibilities, project associations, explicit decisions, meaningful status, or clearly stated preferences. Do not summarize, infer attendance, or attach claims to organizations/events as people.
 SECURITY: Never reproduce passwords, tokens, keys, secrets, or credentials.
-Return JSON only with {"tasks":[],"claims":[]}.
+Call ${EXTRACTION_TOOL_NAME} exactly once with the extracted tasks and claims (empty arrays are correct when there is nothing to extract).
 Task shape: {"title":"...","description":null,"assigneeEmail":null,"dueAt":null,"priority":"low|normal|high|urgent","evidence":"exact supporting excerpt","sectionOrdinal":0,"confidence":0.0,"owner":"dave","ownershipBasis":"explicit_assignment_to_dave|explicit_acceptance_by_dave","ownershipEvidence":"exact excerpt proving Dave owns it"}.
 Claim shape: {"statement":"...","claimType":"fact|role|responsibility|relationship|project_association|decision|status|milestone|preference|governing_context|working_context|other","subjectEmail":"participant@example.com","evidence":"exact supporting excerpt","sectionOrdinal":0,"evidenceStrength":"weak|moderate|strong"}.`,
-      messages: [{ role: "user", content: `Meeting: ${title}\nMeeting date: ${occurredAt ?? "Unknown"}\nKnown participant emails: ${participantEmails.join(", ") || "None supplied"}\n\n${relevant}` }],
+      userContent: `Meeting: ${title}\nMeeting date: ${occurredAt ?? "Unknown"}\nKnown participant emails: ${participantEmails.join(", ") || "None supplied"}\n\n${relevant}`,
     });
-    const text = response.content.find((item) => item.type === "text");
-    const extracted = text?.type === "text" ? parseJson(text.text) : { tasks: [], claims: [] };
 
     const { data: sectionRows, error: sectionError } = await supabaseServer.from("document_sections")
       .select("id, ordinal").eq("artifact_id", artifactId);
