@@ -26,10 +26,12 @@ export type CaptureRecord = {
   id: string;
   source: string;
   captureType: string;
+  content: string;
   sourceExternalId: string | null;
   capturedAt: string | null;
   receivedAt: string;
   processingStatus: string;
+  metadata: Record<string, unknown>;
 };
 
 export type RecordCaptureResult =
@@ -37,16 +39,18 @@ export type RecordCaptureResult =
   | { duplicate: true; reason: "source_external_id" | "concurrent_insert"; capture: CaptureRecord };
 
 const CAPTURE_COLUMNS =
-  "id, source, capture_type, source_external_id, captured_at, received_at, processing_status";
+  "id, source, capture_type, content, source_external_id, captured_at, received_at, processing_status, metadata";
 
 type CaptureRow = {
   id: string;
   source: string;
   capture_type: string;
+  content: string;
   source_external_id: string | null;
   captured_at: string | null;
   received_at: string;
   processing_status: string;
+  metadata: Record<string, unknown>;
 };
 
 function toRecord(row: CaptureRow): CaptureRecord {
@@ -54,10 +58,12 @@ function toRecord(row: CaptureRow): CaptureRecord {
     id: row.id,
     source: row.source,
     captureType: row.capture_type,
+    content: row.content,
     sourceExternalId: row.source_external_id,
     capturedAt: row.captured_at,
     receivedAt: row.received_at,
     processingStatus: row.processing_status,
+    metadata: row.metadata ?? {},
   };
 }
 
@@ -153,7 +159,7 @@ export async function recordCapture(
  */
 export async function setCaptureStatus(
   captureId: string,
-  status: "processing" | "processed" | "failed",
+  status: "processing" | "processed" | "failed" | "ignored",
   options?: { error?: string | null; metadata?: Record<string, unknown> }
 ): Promise<void> {
   const patch: Record<string, unknown> = {
@@ -161,11 +167,15 @@ export async function setCaptureStatus(
     updated_at: new Date().toISOString(),
   };
 
-  if (status === "processed" || status === "failed") {
+  if (status === "processed" || status === "failed" || status === "ignored") {
     patch.processed_at = new Date().toISOString();
   }
   if (status === "failed") {
     patch.processing_error = options?.error ?? "Unknown processing error";
+  }
+  if (status === "ignored") {
+    // Not a failure -- the reason it was ignored, not an error message.
+    patch.processing_error = options?.error ?? "empty_or_misfire";
   }
   if (status === "processing" || status === "processed") {
     // Clear a stale error from a previous attempt so the row never reads as
@@ -175,4 +185,16 @@ export async function setCaptureStatus(
 
   const { error } = await supabaseServer.from("captures").update(patch).eq("id", captureId);
   if (error) throw new Error(`Could not update capture status: ${error.message}`);
+}
+
+/**
+ * Atomically claims up to `limit` captures at 'received', flipping them to
+ * 'processing' in one statement (compare-and-set via UPDATE ... WHERE ...
+ * RETURNING) so two overlapping maintenance runs can't both load the same
+ * row and process it twice -- see Priority 1's pg_cron concurrency notes.
+ */
+export async function claimReceivedCaptures(limit: number): Promise<CaptureRecord[]> {
+  const { data, error } = await supabaseServer.rpc("claim_received_captures", { p_limit: limit });
+  if (error) throw new Error(`Could not claim captures: ${error.message}`);
+  return ((data ?? []) as CaptureRow[]).map(toRecord);
 }

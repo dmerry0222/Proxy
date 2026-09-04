@@ -10,7 +10,8 @@ export type EvidenceSourceType =
   | "teams_message"
   | "calendar_event"
   | "memory_evidence"
-  | "user_action";
+  | "user_action"
+  | "capture";
 
 export type SourceLocator =
   | { section_id: string }
@@ -19,7 +20,8 @@ export type SourceLocator =
   | { teams_message_id: string; chat_id: string }
   | { calendar_event_id: string; run_guid?: string | null }
   | { memory_evidence_id: string }
-  | { actor: string; action: string };
+  | { actor: string; action: string }
+  | { capture_id: string };
 
 export type EvidenceRelationship =
   | "supports_creation"

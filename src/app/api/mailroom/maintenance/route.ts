@@ -13,6 +13,7 @@ import { reopenStaleMailroomConversations } from "@/lib/mailroom/staleAnalysisRe
 import { runMailroomAnalysis } from "@/lib/mailroom/analyzeMailroom";
 import { syncMailroomToNotion } from "@/lib/notion/syncMailroom";
 import { supabaseServer } from "@/lib/supabase/server";
+import { processReceivedCaptures } from "@/lib/capture/processCapture";
 
 const MAILROOM_ANALYSIS_GAP_KEY = "mailroom_analysis_gap";
 
@@ -242,6 +243,32 @@ export async function GET(request: Request) {
     });
   }
 
+  let captureSummary: Awaited<ReturnType<typeof processReceivedCaptures>> | null = null;
+  try {
+    captureSummary = await processReceivedCaptures(25);
+    if (captureSummary.claimed > 0) {
+      await emitDiagnosticEvent({
+        traceId,
+        module: "mailroom",
+        stage: "maintenance_cycle",
+        eventType: "captures_processed",
+        status: captureSummary.failed > 0 ? "warning" : "success",
+        humanSummary: `Processed ${captureSummary.claimed} capture(s): ${captureSummary.processed} completed, ${captureSummary.ignored} ignored as misfires, ${captureSummary.failed} failed.`,
+        metadata: captureSummary,
+      });
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown capture batch error";
+    await recordIssue({
+      traceId,
+      issueType: "capture_batch_failed",
+      severity: "error",
+      humanSummary: "Capture processing batch failed.",
+      retryable: true,
+      technicalDetail: message,
+    });
+  }
+
   await checkMailroomAnalysisGap(traceId);
 
   const failed = Boolean(analysisError || syncError || (syncSummary && syncSummary.errors.length > 0));
@@ -251,7 +278,9 @@ export async function GET(request: Request) {
       analysisResult?.conversationsAnalyzed ?? 0
     } analyzed, Notion ${
       syncSummary ? `${syncSummary.conversations.created} created / ${syncSummary.conversations.updated} updated` : "not synced"
-    }, backlog ${syncSummary?.backlogNotEligible ?? "unknown"}.`,
+    }, backlog ${syncSummary?.backlogNotEligible ?? "unknown"}, captures ${
+      captureSummary ? `${captureSummary.processed} processed / ${captureSummary.ignored} ignored / ${captureSummary.failed} failed` : "not run"
+    }.`,
   });
 
   return NextResponse.json(
@@ -261,6 +290,7 @@ export async function GET(request: Request) {
       reopened: reopened ?? { reopenedMessages: 0, conversationIds: [] },
       analysis: analysisResult ?? { runId: null, conversationsAnalyzed: 0, error: analysisError },
       notionSync: syncSummary ?? { error: syncError },
+      captures: captureSummary ?? { claimed: 0, processed: 0, ignored: 0, failed: 0 },
     },
     { status: analysisError && syncError ? 500 : 200 }
   );
