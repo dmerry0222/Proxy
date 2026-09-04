@@ -14,6 +14,22 @@ import type { SurfaceObjectType } from "./types";
  * guarded are handled; anything else compares as null and is therefore
  * never treated as overridden.
  */
+/**
+ * A rich_text/title chunk has two possible shapes here: Notion's API
+ * RESPONSE shape (`{ plain_text, text: { content } }`, read via
+ * pages.retrieve for the live-value side of a guard check) and OUR OWN
+ * outgoing REQUEST shape from richTextProperty()/titleProperty() (`{ text:
+ * { content } }`, no `plain_text` -- Notion doesn't need it echoed back).
+ * proposedComparableValues() calls comparableValue() on our own just-built
+ * payload to compute the baseline, so both shapes have to resolve to the
+ * same text or every guarded rich_text/title baseline silently comes out
+ * null -- which is exactly what happened here (Related Project's baseline,
+ * a relation, was fine; Plateau Required/Preparation Notes were not).
+ */
+function chunkText(chunk: any): string {
+  return chunk?.plain_text ?? chunk?.text?.content ?? "";
+}
+
 export function comparableValue(property: any): ComparableValue {
   if (!property) return null;
   switch (property.type) {
@@ -22,11 +38,11 @@ export function comparableValue(property: any): ComparableValue {
     case "checkbox":
       return property.checkbox === true;
     case "rich_text":
-      return (property.rich_text ?? []).map((chunk: any) => chunk?.plain_text ?? "").join("") || null;
+      return (property.rich_text ?? []).map(chunkText).join("") || null;
     // Titles are guardable too: a project renamed in Notion is a real edit,
     // and without this it compared as null and could never be preserved.
     case "title":
-      return (property.title ?? []).map((chunk: any) => chunk?.plain_text ?? "").join("") || null;
+      return (property.title ?? []).map(chunkText).join("") || null;
     case "date":
       return property.date?.start ?? null;
     // Single-target relations only (every relation Proxy writes is one page
