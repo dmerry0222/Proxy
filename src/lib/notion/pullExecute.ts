@@ -101,11 +101,6 @@ function relationPageId(properties: any, key: string): string | null {
   return property?.type === "relation" ? property.relation?.[0]?.id ?? null : null;
 }
 
-function checkboxValue(properties: any, key: string): boolean {
-  const property = properties?.[key];
-  return property?.type === "checkbox" ? property.checkbox === true : false;
-}
-
 function baselineOf(mapping: SurfaceObjectRecord): Record<string, ComparableValue> {
   const stored = mapping.metadata?.guardedBaseline;
   return stored && typeof stored === "object" ? (stored as Record<string, ComparableValue>) : {};
@@ -499,11 +494,10 @@ async function pullMeetings(dryRun: boolean, summary: PullExecuteSummary): Promi
       }
 
       /*
-       * The enrichment row is written whole, from the page's current state:
-       * project, milestone, plateau and prep notes describe one meeting
-       * together, and patching them field-by-field across two identity keys
-       * (project-scoped vs project-less) would be a much easier way to
-       * create orphans.
+       * All four guarded fields are handed to setMeetingPlateau as Notion's
+       * current asserted state for this meeting; it decides per-field
+       * whether to accept, protect, or record a first proposal (see its own
+       * doc comment) and writes the audit trail.
        */
       await setMeetingPlateau({
         calendarEventId: mapping.proxyObjectId,
@@ -511,7 +505,6 @@ async function pullMeetings(dryRun: boolean, summary: PullExecuteSummary): Promi
         milestoneId,
         desiredState: plainText(page.properties, "Plateau Required"),
         preparationNotes: plainText(page.properties, "Preparation Notes"),
-        reviewed: checkboxValue(page.properties, "Reviewed"),
         createdBy: "notion",
         notionPageId: page.id,
       });

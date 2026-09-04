@@ -274,38 +274,57 @@ export type PlateauInput = {
   /** The plateau: what state the project must be in by this meeting. */
   desiredState?: string | null;
   preparationNotes?: string | null;
-  reviewed?: boolean;
-  createdBy?: "ai" | "notion" | "proxy_ui";
+  createdBy?: "ai" | "notion" | "proxy_ui" | "system";
   confidence?: number | null;
   /** The Notion page this write originated from, for the audit trail. Null for a non-Notion write. */
   notionPageId?: string | null;
 };
 
-/**
- * Attaches (or updates) Proxy-owned meaning on a canonical Outlook event.
- *
- * The calendar_events row is never written to. Everything Proxy or Dave has
- * to say about a meeting -- which project it serves, which milestone, the
- * plateau required by it, how to prepare -- lives here, keyed by the Outlook
- * event id. That separation is the whole reason this is a related table
- * rather than extra columns on the event.
- *
- * Upsert identity is (project_state_id, calendar_event_id), already unique;
- * project-less enrichment is kept single per event by a partial unique index,
- * so "notes on this meeting, no project yet" cannot silently multiply.
- */
-const AUDITED_FIELDS = ["project_state_id", "milestone_id", "desired_state", "preparation_notes", "reviewed"] as const;
+type TouchpointFieldName = "project_state_id" | "milestone_id" | "desired_state" | "preparation_notes";
+
+const FIELD_TO_CONFIRMED_COLUMN: Record<TouchpointFieldName, string> = {
+  project_state_id: "project_human_confirmed",
+  milestone_id: "milestone_human_confirmed",
+  desired_state: "desired_state_human_confirmed",
+  preparation_notes: "preparation_notes_human_confirmed",
+};
+
+const FIELD_TO_PROPOSED_COLUMN: Record<TouchpointFieldName, string> = {
+  project_state_id: "proposed_project_state_id",
+  milestone_id: "proposed_milestone_id",
+  desired_state: "proposed_desired_state",
+  preparation_notes: "proposed_preparation_notes",
+};
+
+type TouchpointRow = {
+  id: string;
+  project_state_id: string | null;
+  milestone_id: string | null;
+  desired_state: string | null;
+  preparation_notes: string | null;
+  project_human_confirmed: boolean;
+  milestone_human_confirmed: boolean;
+  desired_state_human_confirmed: boolean;
+  preparation_notes_human_confirmed: boolean;
+  proposed_project_state_id: string | null;
+  proposed_milestone_id: string | null;
+  proposed_desired_state: string | null;
+  proposed_preparation_notes: string | null;
+};
 
 async function recordTouchpointAudit(input: {
   touchpointId: string;
   calendarEventId: string;
   notionPageId: string | null;
   source: "notion" | "proxy_ui" | "ai" | "system";
+  humanConfirmed: boolean;
   previous: Record<string, unknown>;
   next: Record<string, unknown>;
 }): Promise<void> {
-  const rows = AUDITED_FIELDS.filter((field) => (input.previous[field] ?? null) !== (input.next[field] ?? null)).map(
-    (field) => ({
+  const fields: TouchpointFieldName[] = ["project_state_id", "milestone_id", "desired_state", "preparation_notes"];
+  const rows = fields
+    .filter((field) => (input.previous[field] ?? null) !== (input.next[field] ?? null))
+    .map((field) => ({
       touchpoint_id: input.touchpointId,
       calendar_event_id: input.calendarEventId,
       notion_page_id: input.notionPageId,
@@ -313,77 +332,130 @@ async function recordTouchpointAudit(input: {
       previous_value: input.previous[field] === null || input.previous[field] === undefined ? null : String(input.previous[field]),
       new_value: input.next[field] === null || input.next[field] === undefined ? null : String(input.next[field]),
       source: input.source,
-      human_confirmed: input.source === "notion" || input.source === "proxy_ui",
-    })
-  );
+      human_confirmed: input.humanConfirmed,
+    }));
   if (!rows.length) return;
   const { error } = await supabaseServer.from("execute_touchpoint_audit").insert(rows);
   if (error) console.error("Could not record execute_touchpoint_audit rows:", error.message);
 }
 
 /**
- * Writes one meeting's enrichment row whole (see PlateauInput doc) and, for
- * every guarded field that actually changed, one execute_touchpoint_audit
- * row -- add/change/clear are all just a previous/new value pair, clearing
- * being new_value: null. Priority 6: this audit trail was the real gap in an
- * otherwise-already-safe mechanism (guarded-baseline diffing, no Outlook
- * write-back) that had been live since 2026-09-02 with no history at all.
+ * Attaches (or updates) Proxy-owned meaning on a canonical Outlook event.
+ * One row per meeting (calendar_event_id is unique) -- changing or clearing
+ * Related Project is a field-level edit on that one row, not a switch to a
+ * different identity, so its full history stays attached to the meeting.
+ *
+ * Notion is the authoritative human-editing surface for these four fields.
+ * A write with createdBy 'notion'/'proxy_ui' is treated as the human's
+ * current asserted state for ALL four fields (matching what the Notion page
+ * actually shows), each field's *_human_confirmed flag is set, and Proxy's
+ * original proposal (proposed_*) is left untouched -- it is a one-time
+ * snapshot of what Proxy first suggested, not a running value.
+ *
+ * A write with createdBy 'ai'/'system' (no such caller exists yet -- this is
+ * the data model/guard for when one does, per the "Proxy may eventually
+ * propose values" contract) only ever touches a field that is NOT YET
+ * human_confirmed: a human-entered, human-corrected, or human-cleared value
+ * is protected from silent AI overwrite. The first time a not-yet-confirmed
+ * field is populated by a non-human source, proposed_* captures that value
+ * (once; never overwritten by a later AI proposal either) so Proxy's
+ * original suggestion survives even after a human later changes it.
+ *
+ * Every actually-changed field gets one execute_touchpoint_audit row --
+ * add/change/clear are all just previous_value/new_value, clear being
+ * new_value: null. Whether a field was "always blank" vs "explicitly
+ * cleared by a human" is answered by the audit trail itself: no row for
+ * that field means never touched; a human-sourced row with new_value: null
+ * means an explicit clear.
  */
 export async function setMeetingPlateau(input: PlateauInput): Promise<{ id: string; created: boolean }> {
-  const { data: existing, error: existingError } = await (input.projectStateId
-    ? supabaseServer
-        .from("execute_touchpoints")
-        .select("id, project_state_id, milestone_id, desired_state, preparation_notes, reviewed")
-        .eq("calendar_event_id", input.calendarEventId)
-        .eq("project_state_id", input.projectStateId)
-        .maybeSingle()
-    : supabaseServer
-        .from("execute_touchpoints")
-        .select("id, project_state_id, milestone_id, desired_state, preparation_notes, reviewed")
-        .eq("calendar_event_id", input.calendarEventId)
-        .is("project_state_id", null)
-        .maybeSingle());
+  const source: "notion" | "proxy_ui" | "ai" | "system" =
+    input.createdBy === "notion" || input.createdBy === "proxy_ui" || input.createdBy === "system"
+      ? input.createdBy
+      : input.createdBy === "ai"
+        ? "ai"
+        : "proxy_ui";
+  const isHuman = source === "notion" || source === "proxy_ui";
+
+  const { data: existing, error: existingError } = await supabaseServer
+    .from("execute_touchpoints")
+    .select(
+      "id, project_state_id, milestone_id, desired_state, preparation_notes, project_human_confirmed, milestone_human_confirmed, desired_state_human_confirmed, preparation_notes_human_confirmed, proposed_project_state_id, proposed_milestone_id, proposed_desired_state, proposed_preparation_notes"
+    )
+    .eq("calendar_event_id", input.calendarEventId)
+    .maybeSingle<TouchpointRow>();
 
   if (existingError) throw new Error(`Could not look up meeting enrichment: ${existingError.message}`);
 
-  const source: "notion" | "proxy_ui" | "ai" | "system" =
-    input.createdBy === "notion" ? "notion" : input.createdBy === "ai" ? "ai" : "proxy_ui";
-
-  const payload = {
-    calendar_event_id: input.calendarEventId,
+  const incoming: Record<TouchpointFieldName, unknown> = {
     project_state_id: input.projectStateId,
     milestone_id: input.milestoneId ?? null,
     desired_state: input.desiredState?.trim() || null,
     preparation_notes: input.preparationNotes?.trim() || null,
-    reviewed: input.reviewed ?? false,
+  };
+
+  const fieldNames: TouchpointFieldName[] = ["project_state_id", "milestone_id", "desired_state", "preparation_notes"];
+  const patch: Record<string, unknown> = {
+    calendar_event_id: input.calendarEventId,
     created_by: input.createdBy ?? "proxy_ui",
     confidence: input.confidence ?? null,
     updated_at: new Date().toISOString(),
   };
+  const proposedPatch: Record<string, unknown> = {};
+
+  for (const field of fieldNames) {
+    const confirmedColumn = FIELD_TO_CONFIRMED_COLUMN[field];
+    const alreadyConfirmed = existing ? Boolean((existing as unknown as Record<string, unknown>)[confirmedColumn]) : false;
+
+    if (isHuman) {
+      // Notion/proxy_ui is authoritative: accept the value outright and mark
+      // the field confirmed, whether that's setting, correcting, or clearing it.
+      patch[field] = incoming[field];
+      patch[confirmedColumn] = true;
+    } else if (alreadyConfirmed) {
+      // Protected: a human has already spoken for this field. Leave it as-is.
+      patch[field] = existing ? existing[field] : null;
+    } else {
+      // Not yet human-confirmed: AI/system may populate it, and if this is
+      // the first time, capture it as Proxy's original proposal.
+      patch[field] = incoming[field];
+      const proposedColumn = FIELD_TO_PROPOSED_COLUMN[field];
+      const alreadyProposed = existing ? (existing as unknown as Record<string, unknown>)[proposedColumn] != null : false;
+      if (!alreadyProposed && incoming[field] != null) {
+        proposedPatch[proposedColumn] = incoming[field];
+      }
+    }
+  }
+  if (Object.keys(proposedPatch).length) {
+    proposedPatch.proposed_at = new Date().toISOString();
+    Object.assign(patch, proposedPatch);
+  }
 
   if (existing) {
-    const { error } = await supabaseServer.from("execute_touchpoints").update(payload).eq("id", existing.id);
+    const { error } = await supabaseServer.from("execute_touchpoints").update(patch).eq("id", existing.id);
     if (error) throw new Error(`Could not update meeting enrichment: ${error.message}`);
     await recordTouchpointAudit({
-      touchpointId: existing.id as string,
+      touchpointId: existing.id,
       calendarEventId: input.calendarEventId,
       notionPageId: input.notionPageId ?? null,
       source,
+      humanConfirmed: isHuman,
       previous: existing,
-      next: payload,
+      next: patch,
     });
-    return { id: existing.id as string, created: false };
+    return { id: existing.id, created: false };
   }
 
-  const { data, error } = await supabaseServer.from("execute_touchpoints").insert(payload).select("id").single();
+  const { data, error } = await supabaseServer.from("execute_touchpoints").insert(patch).select("id").single();
   if (error || !data) throw new Error(`Could not create meeting enrichment: ${error?.message ?? "Unknown error"}`);
   await recordTouchpointAudit({
     touchpointId: data.id as string,
     calendarEventId: input.calendarEventId,
     notionPageId: input.notionPageId ?? null,
     source,
-    previous: { project_state_id: null, milestone_id: null, desired_state: null, preparation_notes: null, reviewed: false },
-    next: payload,
+    humanConfirmed: isHuman,
+    previous: { project_state_id: null, milestone_id: null, desired_state: null, preparation_notes: null },
+    next: patch,
   });
   return { id: data.id as string, created: true };
 }
