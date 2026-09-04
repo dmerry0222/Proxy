@@ -19,7 +19,14 @@ function intervalMs(): number {
   return minutes * 60_000;
 }
 
-async function runSweep(): Promise<void> {
+/**
+ * Extracted so /api/notion/maintenance/route.ts (the pg_cron-driven caller)
+ * and the in-process interval below can share one implementation instead of
+ * two copies drifting apart. See that route for why pg_cron replaced this
+ * setInterval as the reliable driver; the interval stays as a harmless
+ * fallback in case the process does stay warm between ticks.
+ */
+export async function runNotionExecuteSweep(): Promise<void> {
   const traceId = await startTrace({
     module: "notion",
     sourceType: "scheduled_sweep",
@@ -139,9 +146,9 @@ export function startNotionSyncScheduler(): void {
 
   globalThis.__notionSyncSchedulerStarted = true;
 
-  void runSweep();
+  void runNotionExecuteSweep();
   setInterval(() => {
-    void runSweep();
+    void runNotionExecuteSweep();
   }, intervalMs());
 
   console.log(`Notion sync scheduler started (every ${intervalMs() / 60_000} minute(s)).`);

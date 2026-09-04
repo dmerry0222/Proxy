@@ -181,6 +181,74 @@ export async function recordIssue(input: {
   }
 }
 
+/**
+ * Dedup-key variant of recordIssue: a recurring condition (e.g. the same
+ * scheduled call failing tick after tick) bumps one row's attempt_count
+ * instead of inserting a fresh "open" issue every time it's observed.
+ * Concurrency-safe by construction -- the underlying RPC does a single
+ * atomic `insert ... on conflict (dedup_key) where status in ('open',
+ * 'retrying') do update`, matching diagnostic_issues_dedup_key_open_idx, so
+ * two simultaneous observations of the same key can't both insert.
+ */
+export async function recordOrUpdateIssue(
+  dedupKey: string,
+  input: {
+    issueType: string;
+    severity: Severity;
+    humanSummary: string;
+    technicalDetail?: string | null;
+    objectType?: string | null;
+    objectId?: string | null;
+    sourceType?: string | null;
+    sourceId?: string | null;
+    retryable: boolean;
+    traceId?: string | null;
+    metadata?: Record<string, unknown>;
+  }
+): Promise<string | null> {
+  try {
+    const { data, error } = await supabaseServer.rpc("record_or_update_issue", {
+      p_dedup_key: dedupKey,
+      p_issue_type: input.issueType,
+      p_severity: input.severity,
+      p_human_summary: input.humanSummary,
+      p_technical_detail: input.technicalDetail ?? null,
+      p_object_type: input.objectType ?? null,
+      p_object_id: input.objectId ?? null,
+      p_source_type: input.sourceType ?? null,
+      p_source_id: input.sourceId ?? null,
+      p_retryable: input.retryable,
+      p_trace_id: input.traceId ?? null,
+      p_metadata: input.metadata ?? {},
+    });
+
+    if (error) {
+      console.error("Could not record/update diagnostic issue:", error.message);
+      return null;
+    }
+
+    return data as string;
+  } catch (error) {
+    console.error("Could not record/update diagnostic issue:", error);
+    return null;
+  }
+}
+
+export async function resolveIssueByDedupKey(dedupKey: string, resolutionNote?: string): Promise<void> {
+  try {
+    const { error } = await supabaseServer.rpc("resolve_issue_by_dedup_key", {
+      p_dedup_key: dedupKey,
+      p_resolution_note: resolutionNote ?? null,
+    });
+
+    if (error) {
+      console.error("Could not resolve diagnostic issue by dedup key:", error.message);
+    }
+  } catch (error) {
+    console.error("Could not resolve diagnostic issue by dedup key:", error);
+  }
+}
+
 export async function resolveIssue(
   issueId: string,
   input: { status: IssueStatus; resolutionNote?: string }

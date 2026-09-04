@@ -1,10 +1,75 @@
 import { NextResponse } from "next/server";
 
 import { AdminAuthError, requireAdminAuth } from "@/lib/auth/adminAuth";
-import { completeTrace, emitDiagnosticEvent, recordIssue, startTrace } from "@/lib/diagnostics/emitEvent";
+import {
+  completeTrace,
+  emitDiagnosticEvent,
+  recordIssue,
+  recordOrUpdateIssue,
+  resolveIssueByDedupKey,
+  startTrace,
+} from "@/lib/diagnostics/emitEvent";
 import { reopenStaleMailroomConversations } from "@/lib/mailroom/staleAnalysisRepair";
 import { runMailroomAnalysis } from "@/lib/mailroom/analyzeMailroom";
 import { syncMailroomToNotion } from "@/lib/notion/syncMailroom";
+import { supabaseServer } from "@/lib/supabase/server";
+
+const MAILROOM_ANALYSIS_GAP_KEY = "mailroom_analysis_gap";
+
+/**
+ * Priority 1 IG health requirement: email ingestion staying current while
+ * Mailroom analysis silently stops (exactly what happened 2026-09-01) must
+ * surface as an open issue, and a later successful run must auto-resolve it.
+ * Checked after every maintenance cycle regardless of that cycle's own
+ * outcome, since the interesting case is "ingestion fine, analysis broken",
+ * not just "this one call failed".
+ */
+async function checkMailroomAnalysisGap(traceId: string | null): Promise<void> {
+  const [{ data: newestEmail }, { data: lastSuccess }] = await Promise.all([
+    supabaseServer
+      .from("emails")
+      .select("received_at")
+      .eq("is_in_inbox", true)
+      .order("received_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    supabaseServer
+      .from("diagnostic_traces")
+      .select("started_at")
+      .eq("module", "mailroom")
+      .eq("status", "completed")
+      .order("started_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+  ]);
+
+  if (!newestEmail?.received_at) return;
+
+  const ingestionCurrentMs = Date.now() - new Date(newestEmail.received_at).getTime();
+  const ingestionCurrent = ingestionCurrentMs < 2 * 60 * 60 * 1000; // 2 hours
+  if (!ingestionCurrent) return;
+
+  const gapMs = lastSuccess?.started_at
+    ? Date.now() - new Date(lastSuccess.started_at).getTime()
+    : Number.POSITIVE_INFINITY;
+  const operatingIntervalMs = 30 * 60 * 1000; // 6x the 5-minute cron cadence
+
+  if (gapMs > operatingIntervalMs) {
+    await recordOrUpdateIssue(MAILROOM_ANALYSIS_GAP_KEY, {
+      issueType: "mailroom_analysis_gap",
+      severity: "error",
+      humanSummary: "Email ingestion is current, but no successful Mailroom analysis run has completed within the expected operating interval.",
+      technicalDetail: lastSuccess?.started_at
+        ? `Last successful mailroom trace started at ${lastSuccess.started_at}.`
+        : "No successful mailroom trace found at all.",
+      sourceType: "cron",
+      retryable: true,
+      traceId,
+    });
+  } else {
+    await resolveIssueByDedupKey(MAILROOM_ANALYSIS_GAP_KEY, "A subsequent Mailroom maintenance cycle completed successfully.");
+  }
+}
 
 /**
  * The reliable, Vercel-cron-compatible replacement for "press Analyze Next
@@ -176,6 +241,8 @@ export async function GET(request: Request) {
       technicalDetail: syncError,
     });
   }
+
+  await checkMailroomAnalysisGap(traceId);
 
   const failed = Boolean(analysisError || syncError || (syncSummary && syncSummary.errors.length > 0));
   await completeTrace(traceId, {

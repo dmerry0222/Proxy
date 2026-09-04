@@ -59,6 +59,19 @@ const HEALTH_CHECKS: Array<{
     staleAfterMs: 1000 * 60 * 60 * 24 * 7,
   },
   {
+    key: "mailroom_analysis",
+    label: "Mailroom Analysis",
+    module: "mailroom",
+    sourceType: "cron",
+    /*
+     * Sized to the pg_cron maintenance cadence (every 5 minutes) rather than
+     * the 24h/7d windows above -- this is exactly the tile that would have
+     * caught the 2026-09-01 regression, where email ingestion stayed current
+     * but analysis silently stopped for two days.
+     */
+    staleAfterMs: 1000 * 60 * 30,
+  },
+  {
     key: "capture",
     label: "Capture",
     module: "capture",
