@@ -1,6 +1,6 @@
 import "server-only";
 
-import { emitDiagnosticEvent, recordIssue } from "@/lib/diagnostics/emitEvent";
+import { emitDiagnosticEvent, recordOrUpdateIssue, resolveIssueByDedupKey } from "@/lib/diagnostics/emitEvent";
 import { notionClient } from "./client";
 import { computeCanonicalHash, ensureSurfaceMapping, getSurfaceMapping, markPushed, markSyncError } from "./mapping";
 import { resolveGuardedProperties, type ComparableValue } from "./guardedProperties";
@@ -227,6 +227,7 @@ export async function syncOne(params: {
         ...(params.unarchiveOnUpdate ? { archived: false } : {}),
       });
       await markPushed(mapping.id, { externalObjectId: mapping.externalObjectId, canonicalHash, metadata });
+      await resolveIssueByDedupKey(`notion_sync_failed:${params.objectType}:${params.objectId}`, "A subsequent push for this object succeeded.");
       return "updated";
     }
 
@@ -257,6 +258,7 @@ export async function syncOne(params: {
           ? { ...mapping.metadata, [GUARDED_BASELINE_KEY]: proposedComparableValues(createProperties, guardedOnCreate) }
           : undefined,
     });
+    await resolveIssueByDedupKey(`notion_sync_failed:${params.objectType}:${params.objectId}`, "A subsequent push for this object succeeded.");
     return "created";
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -273,8 +275,13 @@ export async function syncOne(params: {
       humanSummary: `Failed to push ${params.objectType} ${params.objectId} to Notion`,
       technicalDetail: message,
     });
-    await recordIssue({
-      traceId: params.traceId,
+    // Deduped by (objectType, objectId): a plain recordIssue here produced
+    // 27,000+ open issues in ~11.5 hours during the 2026-09-04 "Reviewed is
+    // not a property" incident -- every failed sync attempt for every
+    // affected object opened a fresh row. One row per object now, bumped on
+    // repeat failure, auto-resolved via resolveNotionSyncIssue below the
+    // next time this exact object pushes successfully.
+    await recordOrUpdateIssue(`notion_sync_failed:${params.objectType}:${params.objectId}`, {
       issueType: "notion_sync_failed",
       severity: "error",
       humanSummary: `Notion push failed for ${params.objectType} ${params.objectId}`,
@@ -282,6 +289,7 @@ export async function syncOne(params: {
       objectId: params.objectId,
       retryable: true,
       technicalDetail: message,
+      traceId: params.traceId,
     });
     return "error";
   }
