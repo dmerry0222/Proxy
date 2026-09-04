@@ -14,6 +14,7 @@ import { runMailroomAnalysis } from "@/lib/mailroom/analyzeMailroom";
 import { syncMailroomToNotion } from "@/lib/notion/syncMailroom";
 import { supabaseServer } from "@/lib/supabase/server";
 import { processReceivedCaptures } from "@/lib/capture/processCapture";
+import { recoverStaleJobs } from "@/lib/ops/staleJobRecovery";
 
 const MAILROOM_ANALYSIS_GAP_KEY = "mailroom_analysis_gap";
 
@@ -264,6 +265,33 @@ export async function GET(request: Request) {
       issueType: "capture_batch_failed",
       severity: "error",
       humanSummary: "Capture processing batch failed.",
+      retryable: true,
+      technicalDetail: message,
+    });
+  }
+
+  try {
+    const staleRecovery = await recoverStaleJobs();
+    const totalRecovered =
+      staleRecovery.executionCommands.checked + staleRecovery.sourceSyncRuns.resetToPending;
+    if (totalRecovered > 0) {
+      await emitDiagnosticEvent({
+        traceId,
+        module: "mailroom",
+        stage: "maintenance_cycle",
+        eventType: "stale_jobs_recovered",
+        status: "success",
+        humanSummary: `Stale-job recovery: ${staleRecovery.executionCommands.checked} execution_command(s) reviewed (${JSON.stringify(staleRecovery.executionCommands.dispositions)}), ${staleRecovery.sourceSyncRuns.resetToPending} source_sync_run(s) reset to pending.`,
+        metadata: staleRecovery,
+      });
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown stale-job recovery error";
+    await recordIssue({
+      traceId,
+      issueType: "stale_job_recovery_failed",
+      severity: "error",
+      humanSummary: "Stale-job recovery sweep failed.",
       retryable: true,
       technicalDetail: message,
     });
