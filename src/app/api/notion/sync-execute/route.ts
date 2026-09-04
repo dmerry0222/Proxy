@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { AdminAuthError, requireAdminAuth } from "@/lib/auth/adminAuth";
 import { completeTrace, recordIssue, startTrace } from "@/lib/diagnostics/emitEvent";
+import { withAppLease } from "@/lib/notion/appLease";
 import { syncExecuteToNotion } from "@/lib/notion/syncExecute";
 
 /**
@@ -47,8 +48,18 @@ export async function POST(request: Request) {
   });
 
   try {
-    const summary = await syncExecuteToNotion({ dryRun, traceId });
+    // Dry runs are read-mostly (no guarded-property writes), so they don't
+    // need the lease -- only a real run races the scheduled sweep.
+    const outcome = dryRun
+      ? await syncExecuteToNotion({ dryRun, traceId })
+      : await withAppLease("notion_execute_sync", 10, () => syncExecuteToNotion({ dryRun, traceId }));
 
+    if ("skipped" in outcome) {
+      await completeTrace(traceId, { status: "completed", summary: "Skipped: a Notion Execute sync is already in progress." });
+      return NextResponse.json({ success: true, traceId, skipped: true, reason: "sync_already_in_progress" });
+    }
+
+    const summary = outcome;
     const totalErrors = summary.errors.length;
     await completeTrace(traceId, {
       status: totalErrors > 0 ? "failed" : "completed",

@@ -3,6 +3,7 @@ import "server-only";
 import { startTrace, completeTrace } from "@/lib/diagnostics/emitEvent";
 import { ingestMailroomNeedsAttention } from "@/lib/execute/mailroomIntake";
 import { refreshExecuteCuration } from "@/lib/execute/refreshCuration";
+import { withAppLease } from "@/lib/notion/appLease";
 import { pullExecuteFromNotion } from "@/lib/notion/pullExecute";
 import { syncExecuteToNotion } from "@/lib/notion/syncExecute";
 import { syncMailroomToNotion } from "@/lib/notion/syncMailroom";
@@ -27,6 +28,13 @@ function intervalMs(): number {
  * fallback in case the process does stay warm between ticks.
  */
 export async function runNotionExecuteSweep(): Promise<void> {
+  const outcome = await withAppLease("notion_execute_sync", 10, runNotionExecuteSweepBody);
+  if (outcome && "skipped" in outcome) {
+    console.log("Notion Execute sweep skipped: another sync (scheduled or manual) is already in progress.");
+  }
+}
+
+async function runNotionExecuteSweepBody(): Promise<void> {
   const traceId = await startTrace({
     module: "notion",
     sourceType: "scheduled_sweep",
