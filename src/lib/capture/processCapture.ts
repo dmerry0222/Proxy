@@ -3,7 +3,7 @@ import "server-only";
 import { supabaseServer } from "@/lib/supabase/server";
 import { claimReceivedCaptures, setCaptureStatus, type CaptureRecord } from "@/lib/capture/recordCapture";
 import { recordExecutionEvidence } from "@/lib/reconciliation/evidence";
-import { recordOrUpdateIssue } from "@/lib/diagnostics/emitEvent";
+import { recordOrUpdateIssue, resolveIssueByDedupKey } from "@/lib/diagnostics/emitEvent";
 
 /**
  * Priority 2: the processor the capture front door was built ahead of (see
@@ -165,6 +165,7 @@ export async function processCapture(capture: CaptureRecord): Promise<CaptureOut
         : await createMemorySourceFromCapture(capture);
 
     await setCaptureStatus(capture.id, "processed");
+    await resolveIssueByDedupKey(`capture_processing_failed:${capture.id}`, "A subsequent processing attempt for this capture succeeded.");
     return outcome;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown capture processing error";
